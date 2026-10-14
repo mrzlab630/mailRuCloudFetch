@@ -1,30 +1,51 @@
 #!/usr/bin/env python3
 """Cloud.Mail.ru WebDAV TUI downloader."""
 from __future__ import annotations
-import asyncio, base64, json, os, re, stat, sys, tempfile, time, threading, webbrowser, xml.etree.ElementTree as ET
+import asyncio, base64, json, os, re, shutil, stat, sys, tempfile, time, threading, webbrowser, xml.etree.ElementTree as ET
+import hashlib
+import ntpath
+import unicodedata
+from rich.text import Text
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
-from urllib.parse import quote, unquote, urljoin, urlparse
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from urllib.parse import quote, unquote, urlsplit
 import requests
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Header, Input, Label, ProgressBar, Select, Static, DataTable, Button
+from textual.widgets import Footer, Input, Label, ProgressBar, Select, Static, DataTable, Button
 from textual import work
 
 BASE = "https://webdav.cloud.mail.ru/"
-__version__ = "1.0.0"
-PRIVATE_CREDENTIALS = Path.home() / '.config' / 'cloudmailru' / 'credentials.enc'
+__version__ = "1.2.0"
+def credentials_path():
+    if os.name == 'nt':
+        directory = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
+    else:
+        directory = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+    if not directory.is_absolute(): directory = Path.home() / ('.config' if os.name != 'nt' else 'AppData/Roaming')
+    # Preserve existing vaults if XDG_CONFIG_HOME was introduced later.
+    legacy = Path.home() / '.config' / 'cloudmailru' / 'credentials.enc'
+    return legacy if legacy.exists() or legacy.is_symlink() else directory / 'cloudmailru' / 'credentials.enc'
+
+PRIVATE_CREDENTIALS = credentials_path()
 PROPFIND = b'''<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/><d:getlastmodified/><d:creationdate/><d:getcontenttype/><d:getetag/></d:prop></d:propfind>'''
+
+def current_user_owns(path):
+    return os.name == 'nt' or getattr(os, 'getuid', lambda: path.stat().st_uid)() == path.stat().st_uid
+
+def restrictive_mode_ok(path):
+    return os.name == 'nt' or not (path.stat().st_mode & 0o077)
 
 def config():
     d = {}
     p = Path(__file__).with_name('.env')
     if p.exists():
-        for line in p.read_text().splitlines():
+        for line in p.read_text(encoding='utf-8').splitlines():
             if '=' in line and not line.lstrip().startswith('#'):
                 k, v = line.split('=', 1); d[k.strip()] = v.strip().strip("'\"")
     for k in ('MAIL_CLOUD_USER', 'MAIL_CLOUD_WEBDAV_KEY'):
@@ -43,7 +64,7 @@ def save_config(user: str, key: str, master: str):
         raise ValueError('Мастер-пароль должен содержать минимум 12 символов')
     PRIVATE_CREDENTIALS.parent.mkdir(parents=True, exist_ok=True)
     directory = PRIVATE_CREDENTIALS.parent.lstat()
-    if PRIVATE_CREDENTIALS.parent.is_symlink() or not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid():
+    if PRIVATE_CREDENTIALS.parent.is_symlink() or not stat.S_ISDIR(directory.st_mode) or not current_user_owns(PRIVATE_CREDENTIALS.parent):
         raise ValueError('Приватный каталог должен принадлежать вам и не быть symlink')
     os.chmod(PRIVATE_CREDENTIALS.parent, 0o700)
     if PRIVATE_CREDENTIALS.is_symlink():
@@ -67,17 +88,18 @@ def unlock_config(master: str) -> dict[str, str]:
     if not PRIVATE_CREDENTIALS.exists():
         raise FileNotFoundError(f'Зашифрованное хранилище не найдено: {PRIVATE_CREDENTIALS}')
     info = PRIVATE_CREDENTIALS.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+    if not stat.S_ISREG(info.st_mode) or not current_user_owns(PRIVATE_CREDENTIALS) or not restrictive_mode_ok(PRIVATE_CREDENTIALS):
         raise ValueError('Зашифрованный файл должен принадлежать вам и иметь права 0600')
     try:
         payload = json.loads(PRIVATE_CREDENTIALS.read_text(encoding='utf-8'))
-        if payload.get('version') != 1: raise ValueError('Неподдерживаемая версия хранилища')
-        salt = base64.b64decode(payload['salt']); nonce = base64.b64decode(payload['nonce']); ciphertext = base64.b64decode(payload['ciphertext'])
+        if not isinstance(payload,dict) or payload.get('version') != 1 or payload.get('kdf') != 'scrypt-n32768-r8-p1': raise ValueError('Неподдерживаемая версия хранилища')
+        salt = base64.b64decode(payload['salt'],validate=True); nonce = base64.b64decode(payload['nonce'],validate=True); ciphertext = base64.b64decode(payload['ciphertext'],validate=True)
+        if len(salt)!=16 or len(nonce)!=12: raise ValueError('Повреждённое хранилище')
         raw = AESGCM(_derive(master, salt)).decrypt(nonce, ciphertext, b'cloudmailru-credentials-v1')
         data = json.loads(raw.decode('utf-8'))
-        if not data.get('user') or not data.get('key'): raise ValueError('В хранилище нет полного набора credentials')
+        if not isinstance(data,dict) or any(not isinstance(data.get(k),str) or not data[k] for k in ('user','key')): raise ValueError('В хранилище нет полного набора credentials')
         return {'MAIL_CLOUD_USER': data['user'], 'MAIL_CLOUD_WEBDAV_KEY': data['key']}
-    except (InvalidTag, KeyError, ValueError, json.JSONDecodeError, UnicodeError, base64.binascii.Error) as exc:
+    except (InvalidTag, KeyError, TypeError, ValueError, UnicodeError) as exc:
         raise ValueError('Не удалось расшифровать credentials: неверный мастер-пароль или повреждённый файл') from exc
 
 def size(n):
@@ -87,7 +109,66 @@ def size(n):
         if x < 1024 or u == 'TiB': return f'{x:.1f} {u}'
         x /= 1024
 
-def clean(name): return re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', name) or 'unnamed'
+def duration(seconds):
+    seconds = max(1, int(seconds + .999))
+    if seconds < 60: return f'{seconds} с'
+    minutes = (seconds + 59) // 60
+    if minutes < 60: return f'{minutes} мин'
+    hours, minutes = divmod(minutes, 60)
+    return f'{hours} ч {minutes:02d} мин'
+
+def remote_path(href):
+    """Decode a DAV href once; internal paths are decoded, never parsed as URLs."""
+    parsed = urlsplit(href)
+    if parsed.netloc and (parsed.scheme,parsed.netloc) != (urlsplit(BASE).scheme,urlsplit(BASE).netloc):
+        raise ValueError('Посторонний сервер в WebDAV href')
+    if parsed.query or parsed.fragment: raise ValueError('Некорректный WebDAV href')
+    path = unquote(parsed.path,errors='strict').rstrip('/') or '/'
+    if not path.startswith('/') or any(p in ('.','..','') for p in path[1:].split('/') if path != '/') or any(ord(c)<32 or c=='\\' for c in path):
+        raise ValueError('Небезопасный путь WebDAV')
+    return path
+
+def validate_local_name(name, windows=None):
+    windows = os.name == 'nt' if windows is None else windows
+    if not name or name in ('.','..') or any(c in name for c in ('/', '\\', '\x00')):
+        raise ValueError('Небезопасное имя локального файла')
+    if windows and (name.endswith((' ','.')) or getattr(ntpath,'isreserved',lambda value: PureWindowsPath(value).is_reserved())(name)
+                    or any(ord(c)<32 or c in '<>:"|?*' for c in name)):
+        raise ValueError('Имя файла не поддерживается Windows; переименуйте объект в облаке')
+
+def local_path_key(path):
+    # Reject aliases conservatively, including on case-sensitive hosts.
+    return unicodedata.normalize('NFC', str(path.resolve())).casefold()
+
+@contextmanager
+def destination_lock(destination):
+    """Coordinate cooperating processes without deleting the lock inode."""
+    destination.mkdir(parents=True,exist_ok=True)
+    path=destination/'.cloudmail-download.lock'
+    if path.is_symlink(): raise ValueError('Symlink вместо файла блокировки')
+    fd=os.open(path,os.O_CREAT|os.O_RDWR|getattr(os,'O_NOFOLLOW',0),0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode): raise ValueError('Некорректный файл блокировки')
+        try:
+            if os.name=='nt':
+                import msvcrt
+                if os.fstat(fd).st_size == 0: os.write(fd,b'0')
+                os.lseek(fd,0,os.SEEK_SET)
+                msvcrt.locking(fd,msvcrt.LK_NBLCK,1)
+            else:
+                import fcntl
+                fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except OSError: raise ValueError('Папка занята или файловая система не поддерживает блокировку') from None
+        yield
+    finally: os.close(fd)
+
+def publish_partial(part,target):
+    """Publish without overwriting or exposing a partially copied final file."""
+    if os.name == 'nt':
+        os.rename(part,target)  # Windows rename refuses an existing destination.
+        return
+    os.link(part,target)  # Unsupported filesystems retain the complete .part.
+    part.unlink()
 
 @dataclass(frozen=True)
 class Entry:
@@ -96,52 +177,70 @@ class Entry:
 
 class DAV:
     def __init__(self, user, key):
-        self.auth = (user, key); self.s = requests.Session(); self.s.auth = self.auth
-        self.s.headers['User-Agent'] = 'cloud-mailru-tui/1.0'
+        self.auth = (user, key)
     def url(self, href):
-        path=urlparse(href).path
-        if urlparse(href).netloc and urlparse(href).netloc != urlparse(BASE).netloc: raise ValueError('Посторонний сервер в WebDAV href')
-        return BASE.rstrip('/') + quote(path, safe='/')
+        if not href.startswith('/') or href.startswith('//'): raise ValueError('Ожидался абсолютный путь в облаке')
+        return BASE.rstrip('/') + quote(href, safe='/')
     def list(self, path='/'):
-        r = self.s.request('PROPFIND', self.url(path), data=PROPFIND, headers={'Depth':'1','Content-Type':'application/xml'}, timeout=30,allow_redirects=False); r.raise_for_status()
-        if r.status_code != 207: raise ValueError(f'PROPFIND HTTP {r.status_code}, ожидался 207')
-        root, result = ET.fromstring(r.content), []
+        path=path.rstrip('/') or '/'
+        with requests.request('PROPFIND',self.url(path),auth=self.auth,data=PROPFIND,headers={'Depth':'1','Content-Type':'application/xml'},timeout=(15,30),allow_redirects=False) as r:
+            r.raise_for_status()
+            if r.status_code != 207: raise ValueError(f'PROPFIND HTTP {r.status_code}, ожидался 207')
+            root=ET.fromstring(r.content)
+        if root.tag != '{DAV:}multistatus': raise ValueError('Некорректный WebDAV XML')
+        result={}
         for node in root.findall('{DAV:}response'):
-            href = unquote(node.findtext('{DAV:}href','')); p = node.find('{DAV:}propstat/{DAV:}prop')
-            if p is None or href.rstrip('/') == path.rstrip('/'): continue
-            name = PurePosixPath(urlparse(href).path.rstrip('/')).name
-            if name in ('.','..') or '\\' in name or '\x00' in name: raise ValueError('Небезопасное имя файла')
-            if str(PurePosixPath(urlparse(href).path.rstrip('/')).parent) != path.rstrip('/') and not (path == '/' and str(PurePosixPath(urlparse(href).path.rstrip('/')).parent) == '/'): continue
-            directory = p.find('{DAV:}resourcetype/{DAV:}collection') is not None
-            raw = p.findtext('{DAV:}getcontentlength'); result.append(Entry(href,name,directory,int(raw) if raw and raw.isdigit() else None,p.findtext('{DAV:}getlastmodified',''),p.findtext('{DAV:}creationdate',''),p.findtext('{DAV:}getcontenttype',''),p.findtext('{DAV:}getetag','')))
-        return sorted(result, key=lambda x:(not x.directory,x.name.casefold()))
+            href=remote_path(node.findtext('{DAV:}href',''))
+            if href==path: continue
+            if str(PurePosixPath(href).parent)!=path: raise ValueError('WebDAV вернул объект вне запрошенной папки')
+            props={}
+            for propstat in node.findall('{DAV:}propstat'):
+                if ' 200 ' in propstat.findtext('{DAV:}status',''):
+                    p=propstat.find('{DAV:}prop')
+                    if p is not None: props.update({c.tag:c for c in p})
+            resource=props.get('{DAV:}resourcetype')
+            if resource is None: raise ValueError('WebDAV не предоставил тип объекта; обновите каталог')
+            def value(name):
+                p=props.get('{DAV:}'+name)
+                return (p.text or '') if p is not None else ''
+            raw=value('getcontentlength')
+            result[href]=Entry(href,PurePosixPath(href).name,resource.find('{DAV:}collection') is not None,int(raw) if raw.isdigit() else None,value('getlastmodified'),value('creationdate'),value('getcontenttype'),value('getetag'))
+        return sorted(result.values(), key=lambda x:(not x.directory,x.name.casefold()))
     def get(self, entry, target, update, cancelled):
+        if cancelled(): return False
+        validate_local_name(target.name)
         if target.exists() or target.is_symlink(): raise ValueError('Файл уже существует; выберите другую папку назначения')
         target.parent.mkdir(parents=True, exist_ok=True); part = target.with_name(target.name+'.part'); meta=target.with_name(target.name+'.part.json')
         if part.is_symlink() or meta.is_symlink(): raise ValueError('Symlink вместо .part запрещён')
-        identity={'path':entry.href,'size':entry.bytes,'etag':entry.etag,'modified':entry.modified}
+        if any(p.exists() and not p.is_file() for p in (part,meta)):
+            raise ValueError('Вместо .part или .part.json найден не обычный файл')
+        identity={'path':entry.href,'size':entry.bytes,'etag':entry.etag,'modified':entry.modified,
+                  'source':hashlib.sha256((BASE+'\n'+self.auth[0]).encode()).hexdigest()}
         done=0
         if part.exists():
-            if not meta.exists() or json.loads(meta.read_text()) != identity: raise ValueError('Частичный файл другой версии; переместите его перед повтором')
+            if not meta.exists() or json.loads(meta.read_text(encoding='utf-8')) != identity: raise ValueError('Частичный файл другой версии; переместите его перед повтором')
             done=part.stat().st_size
         elif meta.exists(): raise ValueError('Существующий .part.json не принадлежит этой загрузке')
-        if part.exists() and entry.bytes is not None and done == entry.bytes:
-            os.link(part,target); part.unlink(); meta.unlink(); update(done,done,0); return True
         if entry.bytes is not None and done > entry.bytes: raise ValueError('Частичный файл больше исходного')
         validator=entry.etag if entry.etag and not entry.etag.startswith('W/') else entry.modified
         headers={'Accept-Encoding':'identity'}
-        if done and validator: headers.update({'Range':f'bytes={done}-','If-Range':validator})
+        if done and validator and done != entry.bytes: headers.update({'Range':f'bytes={done}-','If-Range':validator})
         else: done=0
+        if entry.etag and not entry.etag.startswith('W/'): headers['If-Match']=entry.etag
+        elif entry.modified: headers['If-Unmodified-Since']=entry.modified
         # Per-transfer sessions avoid sharing mutable requests state across threads.
         with requests.get(self.url(entry.href),auth=self.auth,headers=headers,stream=True,timeout=(15,30),allow_redirects=False) as r:
             r.raise_for_status()
-            if r.status_code == 200: done=0
+            if r.status_code == 200:
+                done=0
+                total=int(r.headers['Content-Length']) if 'Content-Length' in r.headers else entry.bytes
             elif r.status_code == 206:
                 match=re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',r.headers.get('Content-Range',''))
-                if not match or int(match[1]) != done or int(match[2]) != int(match[3])-1: raise ValueError('Некорректный Content-Range')
+                if 'Range' not in headers or not match or int(match[1]) != done or int(match[2]) != int(match[3])-1: raise ValueError('Некорректный Content-Range')
+                total=int(match[3])
+                if 'Content-Length' in r.headers and int(r.headers['Content-Length']) != total-done: raise ValueError('Content-Length не соответствует Content-Range')
             else: raise ValueError(f'GET HTTP {r.status_code}')
             if r.headers.get('Content-Encoding','identity') != 'identity': raise ValueError('Сжатый поток не поддерживает безопасное возобновление')
-            total = int(r.headers['Content-Length'])+done if 'Content-Length' in r.headers else entry.bytes
             if entry.bytes is not None and total != entry.bytes: raise ValueError('Размер изменился; обновите каталог')
             if entry.etag and r.headers.get('ETag') and entry.etag != r.headers['ETag']: raise ValueError('Версия изменилась; обновите каталог')
             meta.write_text(json.dumps(identity),encoding='utf-8'); started=time.monotonic(); initial=done
@@ -152,31 +251,206 @@ class DAV:
                     if chunk: f.write(chunk); done += len(chunk); update(done,total,(done-initial)/max(time.monotonic()-started,.001))
                 f.flush(); os.fsync(f.fileno())
         if total is not None and done != total: raise ValueError('Файл неполный; повторите загрузку')
-        os.link(part,target); part.unlink(); meta.unlink(); return True
+        if cancelled(): return False
+        publish_partial(part,target); meta.unlink(); return True
 
 class CloudApp(App):
-    CSS = 'Screen { background: #10151b; } DataTable { height: 1fr; } #bar { height: 3; } #hint { height: 3; color: $text-muted; } #settings, #credentials { height: 3; } #destination { width: 1fr; } #threads { width: 16; } #user, #key, #master { width: 1fr; } #details { height: 3; }'
+    CSS = '''
+    Screen { background: #10151b; }
+    Screen { overflow: hidden; scrollbar-size: 1 1; }
+    Button { height: 1; min-width: 0; width: auto; border: none; padding: 0 1; background: #202c38; }
+    Button:hover { background: #304759; }
+    Button:focus { text-style: bold underline; }
+    #toolbar { height: 1; padding: 0 1; background: #151b23; }
+    #toolbar Button { margin-left: 1; }
+    #summary { width: 1fr; height: 1; color: $text-muted; }
+    #destination-row { height: 1; margin: 1 1 0 1; }
+    #destination-label { width: 19; height: 1; }
+    Input { height: 1; border: none; padding: 0 1; background: #19232d; }
+    Input:focus { border: none; background: #263848; }
+    #credentials { display: none; height: 6; margin: 0 1; padding: 0; background: #151b23; }
+    #credentials.open { display: block; }
+    #credentials Horizontal { height: 1; margin: 0; }
+    #credentials Label { width: 19; height: 1; }
+    #credentials Button { margin-right: 1; }
+    #destination { width: 1fr; }
+    #threads { width: 14; height: 1; border: none; margin-left: 1; }
+    #threads SelectCurrent { height: 1; border: none; padding: 0; }
+    #user, #key, #master { width: 1fr; }
+    DataTable { height: 1fr; min-height: 4; margin: 1 1 0 1; scrollbar-size: 1 1; }
+    #details { height: 1; padding: 0 1; color: $text-muted; }
+    #selection-info { display: none; height: auto; max-height: 3; padding: 0 1; color: $text-muted; }
+    #selection-info.active { display: block; }
+    #selection-info.insufficient { color: $error; }
+    #hint { height: auto; max-height: 2; padding: 0 1; color: $text-muted; }
+    #transfer { display: none; height: auto; max-height: 5; margin: 0 1; background: #19232d; }
+    #transfer.active { display: block; }
+    #transfer-status { height: auto; max-height: 3; }
+    #transfer-controls { height: 1; }
+    #bar { height: 1; width: 1fr; }
+    '''
     BINDINGS = [('q','quit','Выход'),('space','toggle','Выбрать'),('enter','open','Открыть'),('d','download','Скачать'),('b','back','Назад'),('o','browser','Браузер'),('r','refresh','Обновить'),('x','stop','Стоп'),('p','pause','Пауза')]
     def __init__(self, dav, credentials=None):
         super().__init__(); self.dav=dav; self.credentials=credentials or {}; self.path='/'; self.entries=[]; self.selected={}; self.dest=Path.cwd()/'downloads'; self.jobs=[]; self.total=0; self.done=0; self.speed=0
         self.states={}; self.lock=threading.RLock(); self.stop=threading.Event(); self.paused=False; self.downloading=False; self.received=0; self.sample=(time.monotonic(),0)
+        self.selection_signature = None
+        self.selection_stats = None
+        self.selection_error = ''
+        self.selection_generation = 0
+        self.measured_speed = 0.0
+        self.rate_sample = (time.monotonic(), 0)
+        self.disk_signature = None
+        self.disk_free = None
+        self.disk_pending = False
+        self.disk_checked = 0.0
     def compose(self)->ComposeResult:
-        yield Header()
-        with Horizontal(id='settings'):
-            yield Input(str(self.dest),placeholder='Папка назначения',id='destination')
-            yield Select([(str(n)+' потоков',n) for n in (1,2,4,8,16)],value=4,allow_blank=False,id='threads')
-            yield Button('Скачать',id='download')
-        with Horizontal(id='credentials'):
-            yield Input(self.credentials.get('MAIL_CLOUD_USER',''), placeholder='Логин Mail', password=True, id='user')
-            yield Input(self.credentials.get('MAIL_CLOUD_WEBDAV_KEY',''), placeholder='WebDAV ключ', password=True, id='key')
-            yield Input('', placeholder='Мастер-пароль (12+ символов)', password=True, id='master')
-            yield Button('Сохранить зашифрованно',id='save-credentials')
-            yield Button('Расшифровать',id='unlock-credentials')
-        yield Static('',id='hint'); yield DataTable(cursor_type='row',id='table'); yield Static('',id='details'); yield ProgressBar(total=100,show_eta=False,id='bar'); yield Footer()
+        with Horizontal(id='toolbar'):
+            yield Static('',id='summary',markup=False)
+            yield Button('Скачать',id='download',variant='primary')
+            yield Button('Доступ',id='toggle-credentials')
+            yield Button('Обновить',id='refresh')
+        with Horizontal(id='destination-row'):
+            yield Label('Папка назначения',id='destination-label')
+            yield Input(str(self.dest),placeholder='Введите путь',id='destination')
+            yield Select([(f'{n} потоков',n) for n in (1,2,4,8,16)],value=4,allow_blank=False,id='threads')
+        with Vertical(id='credentials'):
+            yield Static('Доступ · данные хранятся зашифрованно',markup=False)
+            with Horizontal():
+                yield Label('Логин Mail')
+                yield Input(self.credentials.get('MAIL_CLOUD_USER',''),password=True,id='user')
+            with Horizontal():
+                yield Label('WebDAV ключ')
+                yield Input(self.credentials.get('MAIL_CLOUD_WEBDAV_KEY',''),password=True,id='key')
+            with Horizontal():
+                yield Label('Мастер-пароль')
+                yield Input('',placeholder='Минимум 12 символов',password=True,id='master')
+            with Horizontal(id='credential-actions'):
+                yield Button('Сохранить зашифрованно',id='save-credentials')
+                yield Button('Расшифровать',id='unlock-credentials')
+        yield DataTable(cursor_type='row',id='table')
+        yield Static('',id='details',markup=False)
+        yield Static('',id='selection-info',markup=False)
+        with Vertical(id='transfer'):
+            yield Static('',id='transfer-status',markup=False)
+            with Horizontal(id='transfer-controls'):
+                yield ProgressBar(total=100,show_eta=False,show_percentage=False,id='bar')
+                yield Button('Пауза',id='pause-download')
+                yield Button('Стоп',id='stop-download')
+        yield Static('',id='hint',markup=False)
+        yield Footer()
     def on_mount(self):
         self.title='MAIL CLOUD · WebDAV'; self.set_interval(.25,self.progress)
+        self.update_summary()
         if self.dav is not None: self.load()
-        else: self.query_one('#hint',Static).update('Введите мастер-пароль и нажмите «Расшифровать» или заполните credentials и сохраните зашифрованно')
+        else: self.query_one('#hint',Static).update('Откройте «Доступ», чтобы разблокировать или сохранить credentials')
+    def update_summary(self):
+        self.query_one('#summary', Static).update(f'{self.path}  ·  выбрано {len(self.selected)}')
+        signature = (id(self.dav), tuple(self.selected.values()))
+        if signature != self.selection_signature:
+            self.selection_signature = signature
+            self.selection_generation += 1
+            self.selection_stats = None
+            self.selection_error = ''
+            picked = list(self.selected.values())
+            if any(e.directory for e in picked):
+                self.scan_selection(picked, self.dav, self.selection_generation)
+            else:
+                self.selection_stats = (len(picked), sum(e.bytes or 0 for e in picked), sum(e.bytes is None for e in picked))
+        self.render_selection()
+
+    @work(exclusive=True, group='selection-size')
+    async def scan_selection(self, picked, dav, generation):
+        # DAV.list owns its request/session; concurrent calls share no session state.
+        scanner = dav
+        total = files = unknown = 0
+        roots = [e for e in picked if not any(p.directory and e.href.startswith(p.href.rstrip('/') + '/') for p in picked if p != e)]
+        stack = roots[:]
+        seen = set()
+        try:
+            while stack:
+                if generation != self.selection_generation: return
+                entry = stack.pop()
+                if entry.href in seen: continue
+                seen.add(entry.href)
+                if entry.directory:
+                    stack.extend(await asyncio.to_thread(scanner.list, entry.href))
+                else:
+                    files += 1
+                    total += entry.bytes or 0
+                    unknown += entry.bytes is None
+            if generation == self.selection_generation:
+                self.selection_stats = (files, total, unknown)
+        except Exception as exc:
+            if generation == self.selection_generation:
+                self.selection_error = self.err(exc)
+        if generation == self.selection_generation: self.render_selection()
+
+    def on_input_changed(self, event):
+        if event.input.id == 'destination' and self.is_mounted:
+            self.render_selection()
+
+    @work(exclusive=True, group='disk-space')
+    async def measure_disk_space(self, raw):
+        def probe():
+            target = Path(raw).expanduser().absolute()
+            while not target.exists():
+                parent = target.parent
+                if parent == target:
+                    raise ValueError('Путь назначения недоступен')
+                target = parent
+            if not target.is_dir():
+                raise ValueError('Путь ведёт к файлу')
+            return shutil.disk_usage(target).free
+        try:
+            free = await asyncio.to_thread(probe)
+            if self.disk_signature == raw:
+                self.disk_free = free
+        except (OSError, ValueError, RuntimeError):
+            if self.disk_signature == raw:
+                self.disk_free = None
+        finally:
+            if self.disk_signature == raw:
+                self.disk_pending = False
+                self.disk_checked = time.monotonic()
+                self.render_selection()
+
+    def render_selection(self):
+        if not self.query('#selection-info'): return  # Timer/worker may finish during teardown.
+        widget = self.query_one('#selection-info', Static)
+        widget.set_class(bool(self.selected), 'active')
+        widget.remove_class('insufficient')
+        if not self.selected: return
+        raw = self.query_one('#destination', Input).value.strip()
+        if raw != self.disk_signature:
+            self.disk_signature = raw
+            self.disk_free, self.disk_pending, self.disk_checked = None, False, 0.0
+        if raw and not self.disk_pending and time.monotonic() - self.disk_checked >= 2:
+            self.disk_pending = True
+            self.measure_disk_space(raw)
+        free = self.disk_free
+        disk = f'Свободно: {size(free)}'
+        if self.selection_error:
+            widget.update(f'Размер не определён · {disk}\n{self.selection_error}')
+            return
+        if self.selection_stats is None:
+            widget.update(f'Подсчёт выбранных папок… · {disk}')
+            return
+        files, total, unknown = self.selection_stats
+        volume = f'{size(total)}' + (f' + {unknown} без размера' if unknown else '')
+        if free is not None:
+            if total > free:
+                disk += f' · Не хватает {size(total-free)}'
+                widget.add_class('insufficient')
+            elif unknown:
+                disk += ' · Размер неполный'
+            else:
+                disk += f' · Запас {size(free-total)}'
+        if unknown: eta = 'Время: размер неполный'
+        elif total == 0: eta = 'Время: 0 с'
+        elif self.measured_speed > 0:
+            eta = f'≈ {duration(total/self.measured_speed)} при {size(self.measured_speed)}/с'
+        else: eta = 'Время: после замера скорости'
+        widget.update(f'Выбрано: {files} файлов · {volume}\n{disk} · {eta}')
     def err(self,e):
         text = f'Ошибка: {e}'
         for value in self.credentials.values():
@@ -186,15 +460,23 @@ class CloudApp(App):
     async def load(self):
         if self.dav is None: return
         dav = self.dav
+        path = self.path
         try:
-            entries=await asyncio.get_running_loop().run_in_executor(None,dav.list,self.path)
-            if dav is self.dav: self.entries=entries; self.refresh_table()
+            entries=await asyncio.get_running_loop().run_in_executor(None,dav.list,path)
+            if dav is self.dav and path == self.path:
+                self.entries=entries
+                for e in entries:
+                    if e.href in self.selected: self.selected[e.href]=e
+                self.selection_signature=None
+                self.refresh_table()
         except Exception as e:
             if dav is self.dav: self.query_one('#hint',Static).update(self.err(e))
     def refresh_table(self):
+        self.query_one('#details',Static).update('')
         t=self.query_one(DataTable); t.clear(columns=True); t.add_columns(' ','Имя','Размер','Тип','Создано','Изменено')
-        for e in self.entries: t.add_row('✓' if e.href in self.selected else ' ',e.name,'Папка' if e.directory else size(e.bytes), 'Папка' if e.directory else (e.content_type or Path(e.name).suffix or 'Файл'), e.created or '—',e.modified or '—',key=e.href)
-        self.query_one('#hint',Static).update(f'{self.path}  |  выбрано: {len(self.selected)}  |  destination: {self.dest}')
+        for e in self.entries: t.add_row('✓' if e.href in self.selected else ' ',Text(e.name),'Папка' if e.directory else size(e.bytes), Text('Папка' if e.directory else (e.content_type or Path(e.name).suffix or 'Файл')), Text(e.created or '—'),Text(e.modified or '—'),key=e.href)
+        self.update_summary()
+        self.query_one('#hint',Static).update('' if self.entries else 'Папка пуста')
     def action_toggle(self):
         if isinstance(self.focused,Input): return
         t=self.query_one(DataTable)
@@ -203,19 +485,30 @@ class CloudApp(App):
         if e.href in self.selected: self.selected.pop(e.href)
         else: self.selected[e.href]=e
         t.update_cell(e.href,t.columns[next(iter(t.columns))].key,'✓' if e.href in self.selected else ' ')
-        self.query_one('#hint',Static).update(f'{self.path} | Выбрано: {len(self.selected)}')
+        self.update_summary()
     def on_data_table_row_highlighted(self,event):
         if event.cursor_row < len(self.entries):
-            e=self.entries[event.cursor_row]; self.query_one('#details',Static).update(f'{e.name}\nТип: {e.content_type or Path(e.name).suffix or "папка"} · Создано: {e.created or "не предоставлено WebDAV"}\nИзменено: {e.modified or "не предоставлено WebDAV"}')
+            self.query_one('#details',Static).update(self.entries[event.cursor_row].name)
     def action_open(self):
         if not self.entries: return
-        e=self.entries[self.query_one(DataTable).cursor_row]
-        if e.directory: self.path=e.href; self.load()
+        row = self.query_one(DataTable).cursor_row
+        if row is None or row < 0 or row >= len(self.entries): return
+        e=self.entries[row]
+        if e.directory:
+            self.path = e.href
+            self.entries = []
+            self.refresh_table()
+            self.load()
     def on_data_table_row_selected(self,event): self.action_open()
-    def action_back(self): self.path=str(PurePosixPath(self.path.rstrip('/')).parent); self.path='/' if self.path=='.' else self.path; self.load()
+    def action_back(self):
+        self.path = str(PurePosixPath(self.path).parent)
+        self.entries = []
+        self.refresh_table()
+        self.load()
     def action_refresh(self): self.load()
     def action_browser(self):
-        path=self.entries[self.query_one(DataTable).cursor_row].href if self.entries else self.path
+        row = self.query_one(DataTable).cursor_row
+        path=self.entries[row].href if self.entries and row is not None and 0 <= row < len(self.entries) else self.path
         webbrowser.open('https://cloud.mail.ru/home'+quote(path,safe='/')); self.query_one('#hint',Static).update('Открыт путь в веб-интерфейсе Mail Cloud; потребуется вход. Публичная ссылка WebDAV не предоставляется.')
     def action_stop(self): self.stop.set(); self.paused=False
     def action_pause(self): self.paused=not self.paused
@@ -223,6 +516,14 @@ class CloudApp(App):
         if event.button.id == 'download': self.action_download()
         elif event.button.id == 'save-credentials': self.save_credentials()
         elif event.button.id == 'unlock-credentials': self.unlock_credentials()
+        elif event.button.id == 'refresh': self.action_refresh()
+        elif event.button.id == 'toggle-credentials': self.toggle_panel('credentials')
+        elif event.button.id == 'pause-download': self.action_pause()
+        elif event.button.id == 'stop-download': self.action_stop()
+    def toggle_panel(self, panel_id):
+        panel = self.query_one(f'#{panel_id}', Vertical)
+        panel.toggle_class('open')
+        if not panel.has_class('open'): self.query_one(DataTable).focus()
     def unlock_credentials(self):
         if self.downloading:
             self.notify('Сначала остановите загрузку', severity='warning'); return
@@ -234,6 +535,7 @@ class CloudApp(App):
             self.query_one('#user', Input).value = credentials['MAIL_CLOUD_USER']
             self.query_one('#key', Input).value = credentials['MAIL_CLOUD_WEBDAV_KEY']
             self.selected.clear(); self.entries=[]; self.states={}; self.path='/'; self.refresh_table(); self.load()
+            self.measured_speed=0; self.query_one('#transfer').remove_class('active')
             self.query_one('#hint', Static).update('Credentials расшифрованы только в памяти процесса')
         except (OSError, ValueError) as exc:
             self.query_one('#hint', Static).update(self.err(exc))
@@ -254,47 +556,74 @@ class CloudApp(App):
             self.credentials = {'MAIL_CLOUD_USER': user, 'MAIL_CLOUD_WEBDAV_KEY': key}
             self.dav = DAV(user, key)
             self.selected.clear(); self.entries=[]; self.states={}; self.path = '/'; self.refresh_table(); self.load()
-            self.query_one('#hint', Static).update(f'Доступ сохранён зашифрованно: {PRIVATE_CREDENTIALS} (0600)')
+            self.measured_speed=0; self.query_one('#transfer').remove_class('active')
+            self.update_summary()
+            self.query_one('#hint', Static).update('Доступ сохранён зашифрованно. Открываю корень Mail Cloud…')
         except (OSError, ValueError) as exc:
             self.query_one('#hint', Static).update(self.err(exc))
         finally:
             self.query_one('#master', Input).value = ''
     def action_download(self):
         if self.downloading or not self.selected: return
-        self.dest=Path(self.query_one('#destination',Input).value).expanduser().absolute()
+        try:
+            raw=self.query_one('#destination',Input).value.strip()
+            if not raw: raise ValueError('Укажите папку назначения')
+            self.dest=Path(raw).expanduser().resolve()
+            if self.dest.exists() and not self.dest.is_dir(): raise ValueError('Путь назначения ведёт к файлу')
+        except (OSError,ValueError,RuntimeError) as exc:
+            self.query_one('#hint',Static).update(self.err(exc)); return
         self.downloading=True; self.stop.clear(); self.paused=False; self.states={}; self.received=0; self.sample=(time.monotonic(),0)
+        self.rate_sample = self.sample
+        self.query_one('#transfer').add_class('active')
+        self.query_one('#transfer-status',Static).update('Подсчитываю файлы и общий размер…')
+        self.query_one('#bar',ProgressBar).update(progress=0)
         self.download_batch(list(self.selected.values()),self.query_one('#threads',Select).value)
     @work(thread=True,group='downloads')
     def download_batch(self,picked,threads):
         try:
-            self.call_from_thread(self.query_one('#hint',Static).update,'Рекурсивное сканирование выбранных папок…')
+            with destination_lock(self.dest): self.run_download_batch(picked,threads)
+        except Exception as exc:
+            self.call_from_thread(self.query_one('#transfer-status',Static).update,self.err(exc))
+        finally:
+            self.downloading=False
+
+    def run_download_batch(self,picked,threads):
+        try:
+            self.call_from_thread(self.query_one('#transfer-status',Static).update,'Подсчитываю файлы и общий размер…')
             jobs=[]; directories=[]; seen=set(); targets=set()
             roots=[e for e in picked if not any(p.directory and e.href.startswith(p.href.rstrip('/')+'/') for p in picked if p != e)]
             stack=[(e,self.dest/e.name) for e in roots]
             while stack:
-                if self.stop.is_set(): return
+                if self.stop.is_set():
+                    self.call_from_thread(self.query_one('#transfer-status',Static).update,'Остановлено'); return
                 e,target=stack.pop()
                 if e.href in seen: continue
                 seen.add(e.href)
+                validate_local_name(e.name)
                 if not target.resolve().is_relative_to(self.dest.resolve()): raise ValueError('Путь назначения выходит за выбранную папку')
-                if target in targets: raise ValueError('Два объекта имеют одинаковый путь назначения')
-                targets.add(target)
+                target_key=local_path_key(target)
+                if target_key in targets or target.name.casefold() == '.cloudmail-download.lock': raise ValueError('Конфликт путей назначения (регистр или Unicode)')
+                targets.add(target_key)
                 if e.directory:
                     directories.append(target); stack.extend((c,target/c.name) for c in self.dav.list(e.href))
                 else: jobs.append((e,target))
             self.total=sum(e.bytes or 0 for e,t in jobs)
             reserved=set()
+            directory_keys={local_path_key(d) for d in directories}
             for e,t in jobs:
                 for p in (t,t.with_name(t.name+'.part'),t.with_name(t.name+'.part.json')):
-                    if p in reserved: raise ValueError('Имена файлов конфликтуют с .part; выберите файлы отдельно')
-                    reserved.add(p)
+                    key=local_path_key(p)
+                    if key in reserved or key in directory_keys: raise ValueError('Имена файлов конфликтуют с .part; выберите файлы отдельно')
+                    reserved.add(key)
             with self.lock: self.states={e.href:[0,e.bytes,0,'Ожидает',''] for e,t in jobs}
             for d in directories: d.mkdir(parents=True,exist_ok=True)
+            if not jobs:
+                self.call_from_thread(self.query_one('#transfer-status',Static).update,'Готово: пустые папки созданы, файлов нет')
             with ThreadPoolExecutor(max_workers=threads) as pool:
                 futures=[pool.submit(self.download_one,e,t) for e,t in jobs]
                 for f in futures: f.result()
-        except Exception as exc: self.call_from_thread(self.notify,self.err(exc),severity='error',timeout=15)
-        finally: self.downloading=False
+        except Exception as exc:
+            self.call_from_thread(self.query_one('#transfer-status',Static).update,self.err(exc))
     def download_one(self,e,target):
         def cancelled():
             while self.paused and not self.stop.is_set(): time.sleep(.1)
@@ -305,20 +634,36 @@ class CloudApp(App):
                 if previous[0] is not None: self.received+=done-previous[0]
                 previous[0]=done; self.states[e.href]=[done,total,speed,'Скачивается','']
         try:
-            if cancelled(): return
+            if cancelled():
+                with self.lock: self.states[e.href][3]='Остановлено'
+                return
             ok=self.dav.get(e,target,up,cancelled)
             with self.lock: self.states[e.href][3]='Готово' if ok else 'Остановлено'; self.states[e.href][2]=0
         except Exception as ex:
             with self.lock: self.states[e.href][3]='Ошибка'; self.states[e.href][4]=self.err(ex); self.states[e.href][2]=0
     def progress(self):
+        if not self.query('#transfer-status'): return
+        self.render_selection()
         with self.lock:
             if not self.states: return
             done=sum(v[0] for v in self.states.values()); total=sum(v[1] or 0 for v in self.states.values()); unknown=sum(v[1] is None for v in self.states.values()); now=time.monotonic()
             speed=(self.received-self.sample[1])/max(now-self.sample[0],.001); self.sample=(now,self.received)
+            elapsed = now-self.rate_sample[0]
+            if self.paused or not self.downloading:
+                self.rate_sample = (now,self.received)
+            elif elapsed >= 2:
+                rate = (self.received-self.rate_sample[1])/elapsed
+                if rate > 0: self.measured_speed = rate
+                self.rate_sample = (now,self.received)
             complete=sum(v[3]=='Готово' for v in self.states.values()); errors=[f'{k}: {v[4]}' for k,v in self.states.items() if v[4]]
             pct=min(100,done/total*100) if total else (100 if complete == len(self.states) else 0)
             self.query_one('#bar',ProgressBar).update(progress=pct)
-            self.query_one('#hint',Static).update(f'{"Пауза" if self.paused else "Загрузка" if self.downloading else "Завершено"}: {pct:.1f}% · {size(speed)}/s · {size(done)} / {size(total)}'+(f' (+{unknown} неизвестных размеров)' if unknown else '')+f'\nГотово: {complete}/{len(self.states)} · Ошибок: {len(errors)}'+('\n'+errors[0] if errors else ''))
+            self.query_one('#transfer').add_class('active')
+            self.query_one('#pause-download',Button).label='Продолжить' if self.paused else 'Пауза'
+            self.query_one('#pause-download',Button).disabled=not self.downloading
+            self.query_one('#stop-download',Button).disabled=not self.downloading
+            eta = f' · Осталось ≈ {duration(max(0,total-done)/self.measured_speed)}' if self.downloading and not self.paused and not unknown and not errors and speed > 0 and self.measured_speed > 0 and done < total else ''
+            self.query_one('#transfer-status',Static).update(f'{"Пауза" if self.paused else "Загрузка" if self.downloading else "Остановлено" if self.stop.is_set() else "Завершено"}: {pct:.1f}% · {size(speed)}/s · {size(done)} / {size(total)}'+(f' (+{unknown} неизвестных размеров)' if unknown else '')+f'\nГотово: {complete}/{len(self.states)} · Ошибок: {len(errors)}'+eta+('\n'+errors[0] if errors else ''))
     async def action_quit(self):
         self.stop.set(); self.paused=False
         if self.downloading:
@@ -327,11 +672,13 @@ class CloudApp(App):
         self.exit()
 
 def main():
+    if '--version' in sys.argv:
+        print(__version__); return 0
     try: c=config()
     except (OSError, ValueError):
         print('Не удалось прочитать приватный файл доступа; проверьте владельца и права 0600.',file=sys.stderr); return 2
     dav = DAV(c['MAIL_CLOUD_USER'],c['MAIL_CLOUD_WEBDAV_KEY']) if c['MAIL_CLOUD_USER'] and c['MAIL_CLOUD_WEBDAV_KEY'] else None
-    if PRIVATE_CREDENTIALS.exists():
+    if PRIVATE_CREDENTIALS.exists() or PRIVATE_CREDENTIALS.is_symlink():
         c = {}; dav = None
     if '--check' in sys.argv:
         if dav is None: print('Нет сохранённых credentials; запустите TUI и заполните форму.',file=sys.stderr); return 2

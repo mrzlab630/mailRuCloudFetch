@@ -1,4 +1,8 @@
 .env
+.env.*
+credentials.env
+credentials.enc
+.cloudmail-download.lock
 .venv/
 __pycache__/
 .pytest_cache/

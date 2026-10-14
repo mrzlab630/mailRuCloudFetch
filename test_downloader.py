@@ -63,6 +63,10 @@ def test_tui_and_recursive_selection():
                     if not app.downloading: break
                 assert (Path(directory)/'folder/a').read_bytes()==b'test'
                 assert app.total==4
+                assert not app.selected
+                app.action_open()
+                await pilot.pause(.2)
+                assert app.query_one(m.DataTable).get_row('/folder/a')[1].style == '#7f8793'
     asyncio.run(check())
 
 def test_ui_progressive_disclosure(tmp_path):
@@ -436,4 +440,52 @@ def test_alias_collisions_fail_before_download(tmp_path, names):
             assert not calls
             assert 'конфликт' in str(app.query_one('#transfer-status').render()).lower()
             assert list(tmp_path.iterdir()) == [tmp_path / '.cloudmail-download.lock']
+    asyncio.run(check())
+
+
+def test_completed_rows_clear_selection_and_keep_cursor(tmp_path):
+    entries = [m.Entry('/'+name, name, False, 4, etag='"v1"')
+               for name in ('done', 'failed', 'stopped')]
+    class Fake:
+        def list(self, path): return entries[:]
+        def get(self, entry, target, update, cancelled):
+            if entry.name == 'failed': raise OSError('test failure')
+            if entry.name == 'stopped': return False
+            target.write_bytes(b'done')
+            update(4, 4, 0)
+            return True
+    async def check():
+        app = m.CloudApp(Fake())
+        async with app.run_test(size=(100, 28)) as pilot:
+            await pilot.pause(.2)
+            app.selected = {e.href:e for e in entries}
+            app.refresh_table()
+            table = app.query_one(m.DataTable)
+            table.move_cursor(row=2)
+            table.focus()
+            app.query_one('#destination', m.Input).value = str(tmp_path)
+            app.action_download()
+            for _ in range(60):
+                await pilot.pause(.05)
+                if not app.downloading: break
+            assert not app.downloading
+            assert app.selected.keys() == {'/failed', '/stopped'}
+            assert table.cursor_row == 2
+            assert all(cell.style == '#7f8793' for cell in table.get_row('/done'))
+            assert table.get_row('/done')[0].plain == ' '
+            assert table.get_row('/failed')[0].plain == '✓'
+            assert table.get_row('/failed')[1].style == ''
+            assert table.get_row('/stopped')[1].style == ''
+            app.action_refresh()
+            await pilot.pause(.2)
+            assert table.get_row('/done')[1].style == '#7f8793'
+            # A completed file can still be explicitly selected for another copy.
+            table.move_cursor(row=0)
+            app.action_toggle()
+            assert '/done' in app.selected
+            # A new cloud version must not inherit the old completion colour.
+            entries[0] = m.Entry('/done', 'done', False, 5, etag='"v2"')
+            app.action_refresh()
+            await pilot.pause(.2)
+            assert table.get_row('/done')[1].style == ''
     asyncio.run(check())

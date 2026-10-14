@@ -21,7 +21,7 @@ from textual.widgets import Footer, Input, Label, ProgressBar, Select, Static, D
 from textual import work
 
 BASE = "https://webdav.cloud.mail.ru/"
-__version__ = "1.2.0"
+__version__ = "1.4.0"
 def credentials_path():
     if os.name == 'nt':
         directory = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
@@ -303,6 +303,7 @@ class CloudApp(App):
         self.disk_free = None
         self.disk_pending = False
         self.disk_checked = 0.0
+        self.downloaded = {}  # Published file versions, for this account/session.
     def compose(self)->ComposeResult:
         with Horizontal(id='toolbar'):
             yield Static('',id='summary',markup=False)
@@ -474,9 +475,29 @@ class CloudApp(App):
     def refresh_table(self):
         self.query_one('#details',Static).update('')
         t=self.query_one(DataTable); t.clear(columns=True); t.add_columns(' ','Имя','Размер','Тип','Создано','Изменено')
-        for e in self.entries: t.add_row('✓' if e.href in self.selected else ' ',Text(e.name),'Папка' if e.directory else size(e.bytes), Text('Папка' if e.directory else (e.content_type or Path(e.name).suffix or 'Файл')), Text(e.created or '—'),Text(e.modified or '—'),key=e.href)
+        for e in self.entries: t.add_row(*self.entry_cells(e),key=e.href)
         self.update_summary()
         self.query_one('#hint',Static).update('' if self.entries else 'Папка пуста')
+    def entry_cells(self, entry):
+        complete = not entry.directory and self.downloaded.get(entry.href) == entry
+        style = '#7f8793' if complete else ''
+        values = ('✓' if entry.href in self.selected else ' ', entry.name,
+                  'Папка' if entry.directory else size(entry.bytes),
+                  'Папка' if entry.directory else (entry.content_type or Path(entry.name).suffix or 'Файл'),
+                  entry.created or '—', entry.modified or '—')
+        return [Text(value, style=style) for value in values]
+
+    def mark_downloaded(self, entry):
+        """Called on the UI thread only after a file is successfully published."""
+        self.downloaded[entry.href] = entry
+        if self.selected.get(entry.href) == entry:
+            self.selected.pop(entry.href)
+        table = self.query_one(DataTable)
+        visible = next((e for e in self.entries if e.href == entry.href), None)
+        if visible is not None:
+            for column, cell in zip(table.columns, self.entry_cells(visible)):
+                table.update_cell(entry.href, column, cell)
+        self.update_summary()
     def action_toggle(self):
         if isinstance(self.focused,Input): return
         t=self.query_one(DataTable)
@@ -484,7 +505,7 @@ class CloudApp(App):
         e=self.entries[t.cursor_row]
         if e.href in self.selected: self.selected.pop(e.href)
         else: self.selected[e.href]=e
-        t.update_cell(e.href,t.columns[next(iter(t.columns))].key,'✓' if e.href in self.selected else ' ')
+        t.update_cell(e.href,next(iter(t.columns)),self.entry_cells(e)[0])
         self.update_summary()
     def on_data_table_row_highlighted(self,event):
         if event.cursor_row < len(self.entries):
@@ -530,6 +551,7 @@ class CloudApp(App):
         master = self.query_one('#master', Input).value
         try:
             credentials = unlock_config(master)
+            self.downloaded.clear()
             self.credentials = credentials
             self.dav = DAV(credentials['MAIL_CLOUD_USER'], credentials['MAIL_CLOUD_WEBDAV_KEY'])
             self.query_one('#user', Input).value = credentials['MAIL_CLOUD_USER']
@@ -553,6 +575,7 @@ class CloudApp(App):
             return
         try:
             save_config(user, key, master)
+            self.downloaded.clear()
             self.credentials = {'MAIL_CLOUD_USER': user, 'MAIL_CLOUD_WEBDAV_KEY': key}
             self.dav = DAV(user, key)
             self.selected.clear(); self.entries=[]; self.states={}; self.path = '/'; self.refresh_table(); self.load()
@@ -622,6 +645,10 @@ class CloudApp(App):
             with ThreadPoolExecutor(max_workers=threads) as pool:
                 futures=[pool.submit(self.download_one,e,t) for e,t in jobs]
                 for f in futures: f.result()
+            successful_folders = [e for e in picked if e.directory and all(
+                self.states[file.href][3] == 'Готово'
+                for file, _ in jobs if file.href.startswith(e.href.rstrip('/')+'/'))]
+            self.call_from_thread(self.clear_completed_folders, successful_folders)
         except Exception as exc:
             self.call_from_thread(self.query_one('#transfer-status',Static).update,self.err(exc))
     def download_one(self,e,target):
@@ -639,8 +666,17 @@ class CloudApp(App):
                 return
             ok=self.dav.get(e,target,up,cancelled)
             with self.lock: self.states[e.href][3]='Готово' if ok else 'Остановлено'; self.states[e.href][2]=0
+            if ok: self.call_from_thread(self.mark_downloaded,e)
         except Exception as ex:
             with self.lock: self.states[e.href][3]='Ошибка'; self.states[e.href][4]=self.err(ex); self.states[e.href][2]=0
+    def clear_completed_folders(self, entries):
+        table = self.query_one(DataTable)
+        for entry in entries:
+            if self.selected.get(entry.href) == entry:
+                self.selected.pop(entry.href)
+                if any(e.href == entry.href for e in self.entries):
+                    table.update_cell(entry.href,next(iter(table.columns)),self.entry_cells(entry)[0])
+        self.update_summary()
     def progress(self):
         if not self.query('#transfer-status'): return
         self.render_selection()

@@ -7,7 +7,7 @@ import ntpath
 import unicodedata
 from rich.text import Text
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import quote, unquote, urlsplit
@@ -21,7 +21,7 @@ from textual.widgets import Footer, Input, Label, ProgressBar, Select, Static, D
 from textual import work
 
 BASE = "https://webdav.cloud.mail.ru/"
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 def credentials_path():
     if os.name == 'nt':
         directory = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
@@ -175,6 +175,40 @@ class Entry:
     href: str; name: str; directory: bool; bytes: int|None = None
     modified: str = ''; created: str = ''; content_type: str = ''; etag: str = ''
 
+def selection_roots(picked):
+    directories = {e.href for e in picked if e.directory}
+    return [e for e in picked if not any(str(parent) in directories for parent in PurePosixPath(e.href).parents)]
+
+class DirectoryIndex:
+    """Share complete directory listings and in-flight requests for one snapshot."""
+    def __init__(self, dav):
+        self.dav = dav
+        self.entries = {}
+        self.pending = {}
+        self.lock = threading.Lock()
+
+    def list(self, path):
+        with self.lock:
+            if path in self.entries: return self.entries[path]
+            future = self.pending.get(path)
+            owner = future is None
+            if owner:
+                future = Future()
+                self.pending[path] = future
+        if not owner: return future.result()
+        try:
+            entries = tuple(self.dav.list(path))
+        except BaseException as exc:
+            with self.lock:
+                del self.pending[path]
+                future.set_exception(exc)
+            raise
+        with self.lock:
+            self.entries[path] = entries
+            del self.pending[path]
+            future.set_result(entries)
+        return entries
+
 class DAV:
     def __init__(self, user, key):
         self.auth = (user, key)
@@ -182,8 +216,21 @@ class DAV:
         if not href.startswith('/') or href.startswith('//'): raise ValueError('Ожидался абсолютный путь в облаке')
         return BASE.rstrip('/') + quote(href, safe='/')
     def list(self, path='/'):
+        # A slow collection must not discard every directory already scanned.
+        # Retry only transient failures, with more time for large PROPFIND replies.
+        for attempt, read_timeout in enumerate((30, 60, 120)):
+            try:
+                return self._list(path, read_timeout)
+            except requests.HTTPError as exc:
+                if exc.response is None or exc.response.status_code not in (429, 500, 502, 503, 504): raise
+                if attempt == 2: raise
+            except (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError):
+                if attempt == 2: raise
+            time.sleep(attempt + 1)
+
+    def _list(self, path, read_timeout):
         path=path.rstrip('/') or '/'
-        with requests.request('PROPFIND',self.url(path),auth=self.auth,data=PROPFIND,headers={'Depth':'1','Content-Type':'application/xml'},timeout=(15,30),allow_redirects=False) as r:
+        with requests.request('PROPFIND',self.url(path),auth=self.auth,data=PROPFIND,headers={'Depth':'1','Content-Type':'application/xml'},timeout=(15,read_timeout),allow_redirects=False) as r:
             r.raise_for_status()
             if r.status_code != 207: raise ValueError(f'PROPFIND HTTP {r.status_code}, ожидался 207')
             root=ET.fromstring(r.content)
@@ -295,8 +342,10 @@ class CloudApp(App):
         self.states={}; self.lock=threading.RLock(); self.stop=threading.Event(); self.paused=False; self.downloading=False; self.received=0; self.sample=(time.monotonic(),0)
         self.selection_signature = None
         self.selection_stats = None
+        self.selection_complete = False
         self.selection_error = ''
         self.selection_generation = 0
+        self.listings = DirectoryIndex(dav)
         self.measured_speed = 0.0
         self.rate_sample = (time.monotonic(), 0)
         self.disk_signature = None
@@ -345,27 +394,28 @@ class CloudApp(App):
         if self.dav is not None: self.load()
         else: self.query_one('#hint',Static).update('Откройте «Доступ», чтобы разблокировать или сохранить credentials')
     def update_summary(self):
+        if self.listings.dav is not self.dav:
+            self.listings = DirectoryIndex(self.dav)
         self.query_one('#summary', Static).update(f'{self.path}  ·  выбрано {len(self.selected)}')
         signature = (id(self.dav), tuple(self.selected.values()))
         if signature != self.selection_signature:
             self.selection_signature = signature
             self.selection_generation += 1
             self.selection_stats = None
+            self.selection_complete = False
             self.selection_error = ''
             picked = list(self.selected.values())
             if any(e.directory for e in picked):
-                self.scan_selection(picked, self.dav, self.selection_generation)
+                self.scan_selection(picked, self.listings, self.selection_generation)
             else:
                 self.selection_stats = (len(picked), sum(e.bytes or 0 for e in picked), sum(e.bytes is None for e in picked))
+                self.selection_complete = True
         self.render_selection()
 
     @work(exclusive=True, group='selection-size')
-    async def scan_selection(self, picked, dav, generation):
-        # DAV.list owns its request/session; concurrent calls share no session state.
-        scanner = dav
+    async def scan_selection(self, picked, scanner, generation):
         total = files = unknown = 0
-        roots = [e for e in picked if not any(p.directory and e.href.startswith(p.href.rstrip('/') + '/') for p in picked if p != e)]
-        stack = roots[:]
+        stack = selection_roots(picked)
         seen = set()
         try:
             while stack:
@@ -374,15 +424,23 @@ class CloudApp(App):
                 if entry.href in seen: continue
                 seen.add(entry.href)
                 if entry.directory:
+                    self.selection_stats = (files, total, unknown)
+                    self.render_selection()
                     stack.extend(await asyncio.to_thread(scanner.list, entry.href))
                 else:
                     files += 1
                     total += entry.bytes or 0
                     unknown += entry.bytes is None
+                    if files % 256 == 0:
+                        self.selection_stats = (files, total, unknown)
+                        self.render_selection()
+                        await asyncio.sleep(0)
             if generation == self.selection_generation:
                 self.selection_stats = (files, total, unknown)
+                self.selection_complete = True
         except Exception as exc:
             if generation == self.selection_generation:
+                self.selection_stats = (files, total, unknown)
                 self.selection_error = self.err(exc)
         if generation == self.selection_generation: self.render_selection()
 
@@ -430,14 +488,16 @@ class CloudApp(App):
             self.measure_disk_space(raw)
         free = self.disk_free
         disk = f'Свободно: {size(free)}'
-        if self.selection_error:
-            widget.update(f'Размер не определён · {disk}\n{self.selection_error}')
-            return
         if self.selection_stats is None:
             widget.update(f'Подсчёт выбранных папок… · {disk}')
             return
         files, total, unknown = self.selection_stats
         volume = f'{size(total)}' + (f' + {unknown} без размера' if unknown else '')
+        if not self.selection_complete:
+            status = 'Подсчёт не завершён' if self.selection_error else 'Подсчёт…'
+            widget.update(f'{status} · найдено {files} файлов · {volume}\n{disk}' +
+                          (f'\n{self.selection_error}' if self.selection_error else ''))
+            return
         if free is not None:
             if total > free:
                 disk += f' · Не хватает {size(total-free)}'
@@ -461,17 +521,19 @@ class CloudApp(App):
     async def load(self):
         if self.dav is None: return
         dav = self.dav
+        listings = self.listings
         path = self.path
         try:
-            entries=await asyncio.get_running_loop().run_in_executor(None,dav.list,path)
-            if dav is self.dav and path == self.path:
+            entries=await asyncio.to_thread(listings.list,path)
+            if dav is self.dav and listings is self.listings and path == self.path:
                 self.entries=entries
                 for e in entries:
                     if e.href in self.selected: self.selected[e.href]=e
                 self.selection_signature=None
                 self.refresh_table()
         except Exception as e:
-            if dav is self.dav: self.query_one('#hint',Static).update(self.err(e))
+            if dav is self.dav and listings is self.listings and path == self.path:
+                self.query_one('#hint',Static).update(self.err(e))
     def refresh_table(self):
         self.query_one('#details',Static).update('')
         t=self.query_one(DataTable); t.clear(columns=True); t.add_columns(' ','Имя','Размер','Тип','Создано','Изменено')
@@ -526,7 +588,11 @@ class CloudApp(App):
         self.entries = []
         self.refresh_table()
         self.load()
-    def action_refresh(self): self.load()
+    def action_refresh(self):
+        self.listings = DirectoryIndex(self.dav)
+        self.selection_signature = None
+        self.update_summary()
+        self.load()
     def action_browser(self):
         row = self.query_one(DataTable).cursor_row
         path=self.entries[row].href if self.entries and row is not None and 0 <= row < len(self.entries) else self.path
@@ -600,22 +666,24 @@ class CloudApp(App):
         self.query_one('#transfer').add_class('active')
         self.query_one('#transfer-status',Static).update('Подсчитываю файлы и общий размер…')
         self.query_one('#bar',ProgressBar).update(progress=0)
-        self.download_batch(list(self.selected.values()),self.query_one('#threads',Select).value)
+        self.download_batch(list(self.selected.values()),self.query_one('#threads',Select).value,self.listings)
     @work(thread=True,group='downloads')
-    def download_batch(self,picked,threads):
+    def download_batch(self,picked,threads,listings):
         try:
-            with destination_lock(self.dest): self.run_download_batch(picked,threads)
+            with destination_lock(self.dest): self.run_download_batch(picked,threads,listings)
         except Exception as exc:
             self.call_from_thread(self.query_one('#transfer-status',Static).update,self.err(exc))
         finally:
             self.downloading=False
 
-    def run_download_batch(self,picked,threads):
+    def run_download_batch(self,picked,threads,listings):
         try:
             self.call_from_thread(self.query_one('#transfer-status',Static).update,'Подсчитываю файлы и общий размер…')
             jobs=[]; directories=[]; seen=set(); targets=set()
-            roots=[e for e in picked if not any(p.directory and e.href.startswith(p.href.rstrip('/')+'/') for p in picked if p != e)]
+            roots=selection_roots(picked)
             stack=[(e,self.dest/e.name) for e in roots]
+            scanned_bytes = 0
+            reported = time.monotonic()
             while stack:
                 if self.stop.is_set():
                     self.call_from_thread(self.query_one('#transfer-status',Static).update,'Остановлено'); return
@@ -627,9 +695,15 @@ class CloudApp(App):
                 target_key=local_path_key(target)
                 if target_key in targets or target.name.casefold() == '.cloudmail-download.lock': raise ValueError('Конфликт путей назначения (регистр или Unicode)')
                 targets.add(target_key)
+                if e.directory or time.monotonic() - reported >= .25:
+                    self.call_from_thread(self.query_one('#transfer-status',Static).update,
+                                          f'Подсчёт… найдено {len(jobs)} файлов · {size(scanned_bytes)}')
+                    reported = time.monotonic()
                 if e.directory:
-                    directories.append(target); stack.extend((c,target/c.name) for c in self.dav.list(e.href))
-                else: jobs.append((e,target))
+                    directories.append(target); stack.extend((c,target/c.name) for c in listings.list(e.href))
+                else:
+                    jobs.append((e,target))
+                    scanned_bytes += e.bytes or 0
             self.total=sum(e.bytes or 0 for e,t in jobs)
             reserved=set()
             directory_keys={local_path_key(d) for d in directories}

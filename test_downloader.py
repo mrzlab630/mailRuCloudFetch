@@ -190,6 +190,125 @@ def test_selection_scan_does_not_restore_stale_choice():
     try: asyncio.run(check())
     finally: release.set()
 
+def test_large_selection_roots():
+    files = [m.Entry(f'/folder/f{i}', f'f{i}', False, i) for i in range(23425)]
+    assert m.selection_roots(files) == files
+    folder = m.Entry('/folder', 'folder', True)
+    sibling = m.Entry('/folder-other/file', 'file', False, 1)
+    assert m.selection_roots(files + [folder, sibling]) == [folder, sibling]
+
+
+def test_directory_index_shares_inflight_request_and_retries_failure():
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    entry = m.Entry('/folder/a', 'a', False, 8)
+    class Fake:
+        def list(self, path):
+            calls.append(path)
+            entered.set()
+            assert release.wait(3)
+            if len(calls) == 1: raise m.requests.ReadTimeout('slow folder')
+            return [entry]
+    index = m.DirectoryIndex(Fake())
+    with m.ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(index.list, '/folder')
+        assert entered.wait(2)
+        # Observe the second caller waiting on the same request deterministically.
+        waiting = threading.Event()
+        original_result = index.pending['/folder'].result
+        def wait_for_result(*args, **kwargs):
+            waiting.set()
+            return original_result(*args, **kwargs)
+        with patch.object(index.pending['/folder'], 'result', wait_for_result):
+            second = pool.submit(index.list, '/folder')
+            try:
+                assert waiting.wait(2)
+            finally:
+                release.set()
+            for future in (first, second):
+                with pytest.raises(m.requests.ReadTimeout): future.result(2)
+    assert calls == ['/folder']
+    assert index.list('/folder') == (entry,)
+    assert index.list('/folder') == (entry,)
+    assert calls == ['/folder', '/folder']
+
+
+def test_partial_scan_resumes_for_download_without_relisting_successes(tmp_path):
+    calls = []
+    folder = m.Entry('/folder', 'folder', True)
+    class Fake:
+        def list(self, path):
+            calls.append(path)
+            if path == '/': return [folder]
+            if path == '/folder':
+                return [m.Entry('/folder/slow', 'slow', True), m.Entry('/folder/a', 'a', False, 4)]
+            if calls.count('/folder/slow') == 1: raise m.requests.ReadTimeout('slow folder')
+            return [m.Entry('/folder/slow/b', 'b', False, 4)]
+        def get(self, entry, target, update, cancelled):
+            target.write_bytes(b'test')
+            update(4, 4, 0)
+            return True
+    async def check():
+        app = m.CloudApp(Fake())
+        async with app.run_test(size=(100, 28)) as pilot:
+            await pilot.pause(.2)
+            app.selected = {folder.href: folder}
+            app.update_summary()
+            for _ in range(40):
+                await pilot.pause(.05)
+                if app.selection_error: break
+            assert app.selection_stats == (1, 4, 0)
+            assert not app.selection_complete
+            text = str(app.query_one('#selection-info').render())
+            assert 'Подсчёт не завершён' in text and 'найдено 1 файлов' in text
+            assert 'Запас' not in text and 'Выбрано:' not in text
+            app.query_one('#destination', m.Input).value = str(tmp_path)
+            app.action_download()
+            for _ in range(60):
+                await pilot.pause(.05)
+                if not app.downloading: break
+            assert not app.downloading
+            assert (tmp_path / 'folder/a').read_bytes() == b'test'
+            assert (tmp_path / 'folder/slow/b').read_bytes() == b'test'
+            assert calls.count('/folder') == 1
+            assert calls.count('/folder/slow') == 2
+            assert not app.selected
+    asyncio.run(check())
+
+
+def test_listing_snapshot_refresh_and_account_change():
+    folder = m.Entry('/folder', 'folder', True)
+    class Fake:
+        def __init__(self, volume): self.volume = volume; self.calls = []
+        def list(self, path):
+            self.calls.append(path)
+            return [folder] if path == '/' else [m.Entry('/folder/a', 'a', False, self.volume)]
+    async def check():
+        dav = Fake(8)
+        app = m.CloudApp(dav)
+        async with app.run_test(size=(100, 28)) as pilot:
+            await pilot.pause(.2)
+            app.selected = {folder.href: folder}
+            app.update_summary()
+            await pilot.pause(.2)
+            assert app.selection_complete and app.selection_stats == (1, 8, 0)
+            app.action_open()
+            await pilot.pause(.2)
+            assert app.entries[0].bytes == 8
+            assert dav.calls == ['/', '/folder']
+            dav.volume = 16
+            app.action_refresh()
+            await pilot.pause(.2)
+            assert app.entries[0].bytes == 16
+            assert app.selection_stats == (1, 16, 0)
+            assert dav.calls.count('/folder') == 2
+            app.dav = Fake(32)
+            app.update_summary()
+            await pilot.pause(.2)
+            assert app.selection_stats == (1, 32, 0)
+            assert app.dav.calls == ['/folder']
+    asyncio.run(check())
+
 def test_private_credentials_form(tmp_path, monkeypatch):
     monkeypatch.setattr(m, 'PRIVATE_CREDENTIALS', tmp_path / 'config' / 'credentials.enc')
     class Fake:
@@ -264,6 +383,64 @@ def test_dav_special_names_and_propstats():
         assert dav.url(entry.href) == m.BASE + 'a%23b%3Fc%3Bd%2520.txt'
         DAVHandler.xml = DAVHandler.xml.replace(b'/a%23b%3Fc%3Bd%2520.txt', b'/other/child')
         with pytest.raises(ValueError, match='вне'): dav.list()
+
+
+def test_large_dav_listing_recovers_from_read_timeout(monkeypatch):
+    # A real HTTP response stalls after its headers, as requests may report the
+    # body read timeout as ConnectionError rather than ReadTimeout.
+    count = 23425
+    xml = ('<d:multistatus xmlns:d="DAV:">' + ''.join(
+        f'<d:response><d:href>/large/f{i}</d:href><d:propstat><d:prop>'
+        f'<d:resourcetype/><d:getcontentlength>{i}</d:getcontentlength>'
+        '</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>'
+        for i in range(count)) + '</d:multistatus>').encode()
+    release = threading.Event()
+    class SlowDAV(BaseHTTPRequestHandler):
+        calls = 0
+        def log_message(self, *args): pass
+        def do_PROPFIND(self):
+            # Drain the request body before closing, or TCP may reset a large reply.
+            self.rfile.read(int(self.headers.get('Content-Length', '0')))
+            type(self).calls += 1
+            first = type(self).calls == 1
+            self.send_response(207)
+            self.send_header('Content-Length', str(len(xml)))
+            self.end_headers()
+            if first:
+                release.wait(3)
+                return
+            self.wfile.write(xml)
+    monkeypatch.setattr(m.time, 'sleep', lambda _: None)
+    with http_server(SlowDAV):
+        dav = m.DAV('test', 'key')
+        original = dav._list
+        timeouts = []
+        def short_timeout(path, timeout):
+            timeouts.append(timeout)
+            return original(path, .03 if len(timeouts) == 1 else 5)
+        monkeypatch.setattr(dav, '_list', short_timeout)
+        try:
+            index = m.DirectoryIndex(dav)
+            entries = index.list('/large')
+            assert len(entries) == count
+            assert sum(e.bytes for e in entries) == count * (count - 1) // 2
+            assert len({e.href for e in entries}) == count
+            assert index.list('/large') is entries
+            assert SlowDAV.calls == 2 and timeouts == [30, 60]
+        finally:
+            release.set()
+
+
+@pytest.mark.parametrize('status, attempts', [(503, 3), (429, 3), (401, 1), (403, 1), (404, 1)])
+def test_dav_listing_retry_limit_and_permanent_errors(monkeypatch, status, attempts):
+    response = m.requests.Response()
+    response.status_code = status
+    error = m.requests.HTTPError('test failure', response=response)
+    dav = m.DAV('test', 'key')
+    monkeypatch.setattr(m.time, 'sleep', lambda _: None)
+    with patch.object(dav, '_list', side_effect=error) as request:
+        with pytest.raises(m.requests.HTTPError): dav.list('/folder')
+        assert request.call_count == attempts
 
 
 @pytest.mark.parametrize('href', ['/../x', '/%2e%2e/x', '/a//b', '/x%5Cy', '/x%00y', 'https://example.invalid/file', '/x?query', '/x#fragment'])

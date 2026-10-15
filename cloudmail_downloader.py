@@ -16,12 +16,14 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from textual.app import App, ComposeResult
+from textual.screen import ModalScreen
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Input, Label, ProgressBar, Select, Static, DataTable, Button
 from textual import work
 
 BASE = "https://webdav.cloud.mail.ru/"
-__version__ = "1.5.0"
+RETRY_DELAYS = (5, 15, 30, 60)
+__version__ = "1.6.0"
 def credentials_path():
     if os.name == 'nt':
         directory = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
@@ -253,7 +255,7 @@ class DAV:
             raw=value('getcontentlength')
             result[href]=Entry(href,PurePosixPath(href).name,resource.find('{DAV:}collection') is not None,int(raw) if raw.isdigit() else None,value('getlastmodified'),value('creationdate'),value('getcontenttype'),value('getetag'))
         return sorted(result.values(), key=lambda x:(not x.directory,x.name.casefold()))
-    def get(self, entry, target, update, cancelled):
+    def get(self, entry, target, update, cancelled, read_timeout=30):
         if cancelled(): return False
         validate_local_name(target.name)
         if target.exists() or target.is_symlink(): raise ValueError('Файл уже существует; выберите другую папку назначения')
@@ -276,7 +278,7 @@ class DAV:
         if entry.etag and not entry.etag.startswith('W/'): headers['If-Match']=entry.etag
         elif entry.modified: headers['If-Unmodified-Since']=entry.modified
         # Per-transfer sessions avoid sharing mutable requests state across threads.
-        with requests.get(self.url(entry.href),auth=self.auth,headers=headers,stream=True,timeout=(15,30),allow_redirects=False) as r:
+        with requests.get(self.url(entry.href),auth=self.auth,headers=headers,stream=True,timeout=(30 if read_timeout > 30 else 15,read_timeout),allow_redirects=False) as r:
             r.raise_for_status()
             if r.status_code == 200:
                 done=0
@@ -300,6 +302,178 @@ class DAV:
         if total is not None and done != total: raise ValueError('Файл неполный; повторите загрузку')
         if cancelled(): return False
         publish_partial(part,target); meta.unlink(); return True
+
+def retryable_download_error(exc):
+    if isinstance(exc, requests.exceptions.SSLError): return False
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError)):
+        return True
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return exc.response.status_code in (408, 429, 500, 502, 503, 504)
+    return False
+
+class ErrorRetryScreen(ModalScreen):
+    """Review failed files after a batch and retry selected transient failures."""
+    BINDINGS = [
+        ('space', 'toggle_row', 'Отметить'),
+        ('r', 'retry_current', 'Повторить'),
+        ('a', 'retry_all', 'Повторить временные'),
+        ('x', 'stop_retry', 'Стоп'),
+        ('q', 'quit_app', 'Выход'),
+        ('escape', 'close', 'Закрыть'),
+    ]
+    def __init__(self, app):
+        super().__init__()
+        self.owner = app
+        self.order = []
+        self.checked = set()
+        self.rows = {}
+
+    def compose(self):
+        with Vertical(id='error-dialog'):
+            yield Static('Ошибки загрузки', id='error-title', markup=False)
+            yield Static('', id='error-summary', markup=False)
+            with Horizontal(id='error-filter-row'):
+                yield Input(placeholder='Поиск по пути или ошибке', id='error-search')
+                yield Select([('Все', 'all'), ('Временные', 'temporary'), ('Требуют внимания', 'attention'),
+                              ('Готово', 'done'), ('Остановлено', 'stopped')], value='all', allow_blank=False, id='error-filter')
+            yield DataTable(cursor_type='row', id='error-table')
+            yield Static('', id='error-details', markup=False)
+            yield Static('Бережно: 1 поток · чтение 90 с · до 5 попыток · продолжение .part', id='error-profile', markup=False)
+            with Horizontal(id='error-actions'):
+                yield Button('Повторить файл', id='retry-current')
+                yield Button('Повторить отмеченные', id='retry-selected', variant='primary')
+                yield Button('Повторить временные', id='retry-all')
+            with Horizontal(id='error-footer'):
+                yield Button('Стоп', id='retry-stop')
+                yield Button('Закрыть', id='close-errors')
+
+    def on_mount(self):
+        table = self.query_one('#error-table', DataTable)
+        for label, key, width in [(' ', 'check', 1), ('Файл', 'file', max(12, min(44, self.size.width - 68))),
+                                  ('Причина', 'error', 14), ('Сохранено', 'saved', 17), ('Статус', 'status', 15)]:
+            table.add_column(label, key=key, width=width)
+        self.refresh_rows()
+        self.query_one('#error-table', DataTable).focus()
+        self.set_interval(.3, self.refresh_rows)
+
+    def refresh_rows(self):
+        table = self.query_one('#error-table', DataTable)
+        if not table.columns: return
+        with self.owner.lock:
+            jobs = dict(self.owner.error_jobs)
+            states = {href: self.owner.states[href][:] for href in jobs}
+            retryable = dict(self.owner.error_retryable)
+            messages = dict(self.owner.error_messages)
+            attempts = dict(self.owner.retry_attempts)
+        self.checked.intersection_update(href for href in jobs if states[href][3] != 'Готово')
+        search = self.query_one('#error-search', Input).value.casefold()
+        mode = self.query_one('#error-filter', Select).value
+        rows = {}
+        for href, (entry, target) in jobs.items():
+            state = states[href]
+            done, total, _speed, status, message = state
+            total = total if total is not None else entry.bytes
+            label = messages.get(href, message) or status
+            if search not in (href + ' ' + label).casefold(): continue
+            if mode == 'temporary' and (not retryable.get(href) or status == 'Готово'): continue
+            if mode == 'attention' and (retryable.get(href) or status != 'Ошибка'): continue
+            if mode == 'done' and status != 'Готово': continue
+            if mode == 'stopped' and status != 'Остановлено': continue
+            attempt = f' · {attempts[href]}/5' if attempts.get(href) else ''
+            rows[href] = ('✓' if href in self.checked else ' ', href, label,
+                          f'{size(done)} / {size(total)}', status + attempt)
+        order = sorted(rows)
+        if order != self.order:
+            current = self.current_href()
+            table.clear()
+            self.order = order
+            for href in order:
+                table.add_row(*(Text(value) for value in rows[href]), key=href)
+            if current in order: table.move_cursor(row=order.index(current))
+        else:
+            for href in order:
+                for column, value, old in zip(table.columns, rows[href], self.rows.get(href, ('',) * 5)):
+                    if value != old: table.update_cell(href, column, Text(value))
+        self.rows = rows
+        complete = sum(state[3] == 'Готово' for state in states.values())
+        errors = sum(state[3] == 'Ошибка' for state in states.values())
+        stopped = sum(state[3] == 'Остановлено' for state in states.values())
+        active = len(states) - complete - errors - stopped
+        self.query_one('#error-summary', Static).update(
+            f'Готово: {complete} · ошибок: {errors} · стоп: {stopped} · в работе: {active} · отмечено: {len(self.checked)}',
+        )
+        for button in ('retry-current', 'retry-selected', 'retry-all'):
+            self.query_one('#' + button, Button).disabled = self.owner.downloading
+        self.query_one('#retry-stop', Button).disabled = not self.owner.downloading
+        if self.order:
+            self.show_current()
+        else:
+            self.query_one('#error-details', Static).update('Нет файлов для выбранного фильтра.')
+
+    def current_href(self):
+        table = self.query_one('#error-table', DataTable)
+        row = table.cursor_row
+        return self.order[row] if row is not None and 0 <= row < len(self.order) else None
+
+    def show_current(self):
+        href = self.current_href() or (self.order[0] if self.order else None)
+        if href not in self.owner.error_jobs: return
+        entry, target = self.owner.error_jobs[href]
+        state = self.owner.states.get(href, [0, entry.bytes, 0, 'Ошибка', ''])
+        retry = 'временная ошибка' if self.owner.error_retryable.get(href, False) else 'сначала исправьте причину'
+        if state[3] == 'Готово': retry = 'восстановлено'
+        elif state[3] == 'Остановлено': retry = 'можно продолжить'
+        self.query_one('#error-details', Static).update(
+            f'{entry.href}\nЛокальный путь: {target}\n{self.owner.error_messages.get(href) or state[3]} · {retry}',
+        )
+
+    def on_data_table_row_highlighted(self, event):
+        event.stop()
+        self.show_current()
+
+    def on_data_table_row_selected(self, event):
+        event.stop()
+        self.action_toggle_row()
+
+    def on_input_changed(self, event):
+        event.stop()
+        if self.is_mounted: self.refresh_rows()
+
+    def on_select_changed(self, event):
+        event.stop()
+        if self.is_mounted: self.refresh_rows()
+
+    def action_toggle_row(self):
+        if not isinstance(self.focused, DataTable): return
+        href = self.current_href()
+        if href is None or self.owner.states[href][3] == 'Готово': return
+        if href in self.checked: self.checked.remove(href)
+        else: self.checked.add(href)
+        self.refresh_rows()
+
+    def retry_jobs(self, hrefs):
+        if self.owner.downloading: return
+        self.owner.start_error_retry(hrefs)
+        self.refresh_rows()
+
+    def action_retry_current(self): self.retry_jobs([self.current_href()])
+    def action_retry_all(self):
+        self.retry_jobs([href for href in self.owner.error_jobs if self.owner.error_retryable.get(href)])
+    def action_stop_retry(self): self.owner.action_stop()
+    def action_close(self): self.dismiss()
+    async def action_quit_app(self): await self.owner.action_quit()
+
+    def on_button_pressed(self, event):
+        event.stop()
+        actions = {
+            'retry-current': self.action_retry_current,
+            'retry-selected': lambda: self.retry_jobs(sorted(self.checked)),
+            'retry-all': self.action_retry_all,
+            'retry-stop': self.action_stop_retry,
+            'close-errors': self.action_close,
+        }
+        action = actions.get(event.button.id)
+        if action: action()
 
 class CloudApp(App):
     CSS = '''
@@ -335,6 +509,20 @@ class CloudApp(App):
     #transfer-status { height: auto; max-height: 3; }
     #transfer-controls { height: 1; }
     #bar { height: 1; width: 1fr; }
+    #show-errors { display: none; }
+    ErrorRetryScreen { align: center middle; background: #000000 65%; }
+    #error-dialog { width: 96%; height: 94%; max-width: 150; border: round #526a80; padding: 0 1; background: #151b23; }
+    #error-title { height: 1; text-style: bold; }
+    #error-summary { height: 1; }
+    #error-filter-row { height: 1; margin-top: 1; }
+    #error-search { width: 1fr; }
+    #error-filter { width: 24; height: 1; border: none; margin-left: 1; }
+    #error-filter SelectCurrent { height: 1; border: none; padding: 0; }
+    #error-table { margin: 1 0 0 0; min-height: 3; }
+    #error-details { height: 4; margin-top: 1; overflow-y: auto; }
+    #error-profile { height: 1; color: $text-muted; }
+    #error-actions, #error-footer { height: 1; margin-top: 1; }
+    #error-actions Button, #error-footer Button { margin-right: 1; }
     '''
     BINDINGS = [('q','quit','Выход'),('space','toggle','Выбрать'),('enter','open','Открыть'),('d','download','Скачать'),('b','back','Назад'),('o','browser','Браузер'),('r','refresh','Обновить'),('x','stop','Стоп'),('p','pause','Пауза')]
     def __init__(self, dav, credentials=None):
@@ -353,6 +541,14 @@ class CloudApp(App):
         self.disk_pending = False
         self.disk_checked = 0.0
         self.downloaded = {}  # Published file versions, for this account/session.
+        self.error_jobs = {}
+        self.error_retryable = {}
+        self.error_messages = {}
+        self.retry_attempts = {}
+        self.batch_picked = []
+        self.batch_destination = None
+        self.batch_dav = None
+        self.quitting = False
     def compose(self)->ComposeResult:
         with Horizontal(id='toolbar'):
             yield Static('',id='summary',markup=False)
@@ -386,6 +582,7 @@ class CloudApp(App):
                 yield ProgressBar(total=100,show_eta=False,show_percentage=False,id='bar')
                 yield Button('Пауза',id='pause-download')
                 yield Button('Стоп',id='stop-download')
+                yield Button('Ошибки',id='show-errors')
         yield Static('',id='hint',markup=False)
         yield Footer()
     def on_mount(self):
@@ -607,6 +804,7 @@ class CloudApp(App):
         elif event.button.id == 'toggle-credentials': self.toggle_panel('credentials')
         elif event.button.id == 'pause-download': self.action_pause()
         elif event.button.id == 'stop-download': self.action_stop()
+        elif event.button.id == 'show-errors': self.action_show_errors()
     def toggle_panel(self, panel_id):
         panel = self.query_one(f'#{panel_id}', Vertical)
         panel.toggle_class('open')
@@ -618,6 +816,7 @@ class CloudApp(App):
         try:
             credentials = unlock_config(master)
             self.downloaded.clear()
+            self.clear_error_report()
             self.credentials = credentials
             self.dav = DAV(credentials['MAIL_CLOUD_USER'], credentials['MAIL_CLOUD_WEBDAV_KEY'])
             self.query_one('#user', Input).value = credentials['MAIL_CLOUD_USER']
@@ -642,6 +841,7 @@ class CloudApp(App):
         try:
             save_config(user, key, master)
             self.downloaded.clear()
+            self.clear_error_report()
             self.credentials = {'MAIL_CLOUD_USER': user, 'MAIL_CLOUD_WEBDAV_KEY': key}
             self.dav = DAV(user, key)
             self.selected.clear(); self.entries=[]; self.states={}; self.path = '/'; self.refresh_table(); self.load()
@@ -661,6 +861,11 @@ class CloudApp(App):
             if self.dest.exists() and not self.dest.is_dir(): raise ValueError('Путь назначения ведёт к файлу')
         except (OSError,ValueError,RuntimeError) as exc:
             self.query_one('#hint',Static).update(self.err(exc)); return
+        self.clear_error_report()
+        self.batch_destination = self.dest
+        self.batch_dav = self.dav
+        self.batch_picked = list(self.selected.values())
+        self.jobs = []
         self.downloading=True; self.stop.clear(); self.paused=False; self.states={}; self.received=0; self.sample=(time.monotonic(),0)
         self.rate_sample = self.sample
         self.query_one('#transfer').add_class('active')
@@ -674,7 +879,7 @@ class CloudApp(App):
         except Exception as exc:
             self.call_from_thread(self.query_one('#transfer-status',Static).update,self.err(exc))
         finally:
-            self.downloading=False
+            self.call_from_thread(self.finish_download)
 
     def run_download_batch(self,picked,threads,listings):
         try:
@@ -713,6 +918,7 @@ class CloudApp(App):
                     if key in reserved or key in directory_keys: raise ValueError('Имена файлов конфликтуют с .part; выберите файлы отдельно')
                     reserved.add(key)
             with self.lock: self.states={e.href:[0,e.bytes,0,'Ожидает',''] for e,t in jobs}
+            self.jobs = jobs
             for d in directories: d.mkdir(parents=True,exist_ok=True)
             if not jobs:
                 self.call_from_thread(self.query_one('#transfer-status',Static).update,'Готово: пустые папки созданы, файлов нет')
@@ -725,24 +931,118 @@ class CloudApp(App):
             self.call_from_thread(self.clear_completed_folders, successful_folders)
         except Exception as exc:
             self.call_from_thread(self.query_one('#transfer-status',Static).update,self.err(exc))
-    def download_one(self,e,target):
+    def download_one(self,e,target,careful=False):
         def cancelled():
-            while self.paused and not self.stop.is_set(): time.sleep(.1)
+            while self.paused and not self.stop.is_set(): self.stop.wait(.1)
             return self.stop.is_set()
         previous=[None]
         def up(done,total,speed):
             with self.lock:
-                if previous[0] is not None: self.received+=done-previous[0]
+                if previous[0] is not None: self.received+=max(0,done-previous[0])
                 previous[0]=done; self.states[e.href]=[done,total,speed,'Скачивается','']
-        try:
-            if cancelled():
-                with self.lock: self.states[e.href][3]='Остановлено'
+        for attempt in range(5 if careful else 1):
+            try:
+                if cancelled():
+                    self.record_stopped(e,target)
+                    return
+                if careful:
+                    with self.lock: self.retry_attempts[e.href] = attempt + 1
+                previous[0] = None  # Resumed bytes are progress, not newly received traffic.
+                options = {'read_timeout': 90} if careful else {}
+                ok=self.dav.get(e,target,up,cancelled,**options)
+                with self.lock:
+                    self.states[e.href][3]='Готово' if ok else 'Остановлено'
+                    self.states[e.href][2]=0
+                    self.states[e.href][4]=''
+                if ok: self.call_from_thread(self.mark_downloaded,e)
+                else: self.record_stopped(e,target)
                 return
-            ok=self.dav.get(e,target,up,cancelled)
-            with self.lock: self.states[e.href][3]='Готово' if ok else 'Остановлено'; self.states[e.href][2]=0
-            if ok: self.call_from_thread(self.mark_downloaded,e)
-        except Exception as ex:
-            with self.lock: self.states[e.href][3]='Ошибка'; self.states[e.href][4]=self.err(ex); self.states[e.href][2]=0
+            except Exception as ex:
+                part = target.with_name(target.name+'.part')
+                try:
+                    info = part.lstat()
+                    saved = info.st_size if stat.S_ISREG(info.st_mode) else 0
+                except OSError: saved = 0
+                temporary = retryable_download_error(ex)
+                with self.lock:
+                    self.states[e.href][0]=saved
+                    self.states[e.href][2:]=[0,'Ошибка',self.err(ex)]
+                    self.error_jobs[e.href]=(e,target)
+                    self.error_retryable[e.href]=temporary
+                    self.error_messages[e.href]=self.err(ex)
+                if self.stop.is_set():
+                    self.record_stopped(e,target)
+                    return
+                if not careful or not temporary or attempt == 4: return
+                delay = RETRY_DELAYS[attempt]
+                with self.lock: self.states[e.href][3]=f'Повтор через {delay} с'
+                if self.stop.wait(delay):
+                    self.record_stopped(e,target)
+                    return
+
+    def record_stopped(self, entry, target):
+        with self.lock:
+            self.states[entry.href][2:]=[0,'Остановлено','']
+            self.error_jobs[entry.href]=(entry,target)
+            self.error_retryable.setdefault(entry.href,False)
+            self.error_messages.setdefault(entry.href,'Остановлено пользователем')
+
+    def clear_error_report(self):
+        with self.lock:
+            self.error_jobs.clear()
+            self.error_retryable.clear()
+            self.error_messages.clear()
+            self.retry_attempts.clear()
+        self.query_one('#show-errors',Button).display=False
+
+    def finish_download(self):
+        self.downloading=False
+        self.query_one('#show-errors',Button).display=bool(self.error_jobs)
+        if self.error_jobs and not self.stop.is_set() and not self.quitting: self.action_show_errors()
+
+    def action_show_errors(self):
+        if self.error_jobs and not isinstance(self.screen,ErrorRetryScreen):
+            self.push_screen(ErrorRetryScreen(self))
+
+    def start_error_retry(self, hrefs):
+        with self.lock:
+            if self.downloading or self.dav is not self.batch_dav: return
+            jobs=[self.error_jobs[href] for href in dict.fromkeys(hrefs)
+                  if href in self.error_jobs and self.states[href][3] in ('Ошибка','Остановлено')]
+            if not jobs: return
+            for entry, _ in jobs:
+                self.states[entry.href][2:]=[0,'Ожидает','']
+                self.retry_attempts[entry.href]=0
+            self.downloading=True
+        self.stop.clear()
+        self.paused=False
+        self.sample=(time.monotonic(),self.received)
+        self.rate_sample=self.sample
+        if isinstance(self.screen, ErrorRetryScreen):
+            self.screen.refresh_rows()
+        self.retry_error_batch(jobs,self.batch_destination)
+
+    @work(thread=True,group='downloads')
+    def retry_error_batch(self,jobs,destination):
+        try:
+            with destination_lock(destination):
+                for entry,target in jobs:
+                    if not target.resolve().is_relative_to(destination.resolve()):
+                        raise ValueError('Путь назначения выходит за выбранную папку')
+                    self.download_one(entry,target,careful=True)
+            successful_folders=[entry for entry in self.batch_picked if entry.directory and all(
+                self.states[file.href][3]=='Готово'
+                for file,_ in self.jobs if file.href.startswith(entry.href.rstrip('/')+'/'))]
+            self.call_from_thread(self.clear_completed_folders,successful_folders)
+        except Exception as exc:
+            with self.lock:
+                for entry,target in jobs:
+                    if self.states[entry.href][3] != 'Ожидает': continue
+                    self.states[entry.href][2:]=[0,'Ошибка',self.err(exc)]
+                    self.error_messages[entry.href]=self.err(exc)
+                    self.error_retryable[entry.href]=False
+        finally:
+            self.call_from_thread(self.finish_download)
     def clear_completed_folders(self, entries):
         table = self.query_one(DataTable)
         for entry in entries:
@@ -775,6 +1075,7 @@ class CloudApp(App):
             eta = f' · Осталось ≈ {duration(max(0,total-done)/self.measured_speed)}' if self.downloading and not self.paused and not unknown and not errors and speed > 0 and self.measured_speed > 0 and done < total else ''
             self.query_one('#transfer-status',Static).update(f'{"Пауза" if self.paused else "Загрузка" if self.downloading else "Остановлено" if self.stop.is_set() else "Завершено"}: {pct:.1f}% · {size(speed)}/s · {size(done)} / {size(total)}'+(f' (+{unknown} неизвестных размеров)' if unknown else '')+f'\nГотово: {complete}/{len(self.states)} · Ошибок: {len(errors)}'+eta+('\n'+errors[0] if errors else ''))
     async def action_quit(self):
+        self.quitting=True
         self.stop.set(); self.paused=False
         if self.downloading:
             self.notify('Останавливаю потоки и сохраняю .part…',timeout=5)

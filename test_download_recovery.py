@@ -136,6 +136,43 @@ def test_retry_limit_and_stop_interrupts_backoff_and_pending_files(tmp_path, mon
     asyncio.run(check())
 
 
+def test_user_stop_does_not_create_error_report(tmp_path):
+    started = threading.Event()
+    tick = threading.Event()
+    folder = m.Entry('/folder', 'folder', True)
+    entries = [m.Entry('/folder/file', 'file', False, 4)]
+
+    class Fake:
+        def list(self, path):
+            return [folder] if path == '/' else entries
+
+        def get(self, entry, target, update, cancelled, read_timeout=30):
+            started.set()
+            while not cancelled():
+                tick.wait(.01)
+            return False
+
+    async def check():
+        app = m.CloudApp(Fake())
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(.2)
+            app.query_one('#destination', m.Input).value = str(tmp_path)
+            app.selected = {folder.href: folder}
+            app.action_download()
+            assert await asyncio.to_thread(started.wait, 2)
+            app.action_stop()
+            await wait_for_batch(app, pilot)
+            await pilot.pause(.1)
+            assert app.states['/folder/file'][3] == 'Остановлено'
+            assert app.error_jobs == {}
+            assert not app.query_one('#show-errors', m.Button).display
+            assert not isinstance(app.screen, m.ErrorRetryScreen)
+            assert 'Ошибок: 0' in str(app.query_one('#transfer-status', m.Static).render())
+            assert '/folder' in app.selected
+
+    asyncio.run(check())
+
+
 def test_retry_resumes_real_partial_without_recounting_and_clears_folder(tmp_path):
     offset = 256 * 1024
     requests_seen = []

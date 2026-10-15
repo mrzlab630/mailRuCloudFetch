@@ -23,7 +23,7 @@ from textual import work
 
 BASE = "https://webdav.cloud.mail.ru/"
 RETRY_DELAYS = (5, 15, 30, 60)
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 def credentials_path():
     if os.name == 'nt':
         directory = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
@@ -983,9 +983,11 @@ class CloudApp(App):
     def record_stopped(self, entry, target):
         with self.lock:
             self.states[entry.href][2:]=[0,'Остановлено','']
-            self.error_jobs[entry.href]=(entry,target)
-            self.error_retryable.setdefault(entry.href,False)
-            self.error_messages.setdefault(entry.href,'Остановлено пользователем')
+            # A user stop is a normal control action, not a download error.
+            # Keep the row in the report only when an actual error was recorded
+            # earlier in this retry sequence.
+            if entry.href in self.error_jobs:
+                self.error_jobs[entry.href]=(entry,target)
 
     def clear_error_report(self):
         with self.lock:

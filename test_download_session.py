@@ -269,9 +269,17 @@ def test_common_dialog_removes_successes_and_focuses_real_failures(tmp_path, dia
                 app.action_show_resume()
                 await pilot.pause(.1)
                 screen = app.screen
+                assert screen.order == ['bad', 'good', 'slow']
+                assert str(app.query_one('#show-resume', m.Button).label) == 'Докачка (3)'
+                assert 'Незавершённых: 3 · можно продолжить: 3' in str(screen.widget('summary', m.Static).render())
+                screen.widget('filter', m.Select).value = 'attention'
+                await pilot.pause(.05)
+                assert screen.order == ['existing']
                 screen.widget('table', m.DataTable).move_cursor(row=screen.order.index('existing'))
                 await pilot.pause(.05)
                 assert 'Найден на диске' in str(screen.widget('details', m.Static).render())
+                screen.widget('filter', m.Select).value = 'all'
+                await pilot.pause(.05)
                 app.start_resume(['good', 'bad', 'slow'])
             else:
                 app.selected = {entry.href: entry for entry in entries}
@@ -397,15 +405,28 @@ def test_old_completed_file_requires_explicit_adoption(tmp_path):
             assert app.recovery['file']['status'] == 'found'
             assert not app.downloaded
             assert not (tmp_path / JOURNAL_NAME).exists()
+            assert str(app.query_one('#show-resume', m.Button).label) == 'Докачка'
+            assert not app.query_one('#resume-info', m.Static).display
             app.action_show_resume()
             await pilot.pause(.1)
-            assert not app.screen.query_one('#resume-accept', m.Button).disabled
+            assert app.screen.order == []
+            assert 'Незавершённых: 0 · можно продолжить: 0' in str(app.screen.widget('summary', m.Static).render())
+            assert app.screen.query_one('#resume-accept', m.Button).disabled
             assert app.screen.query_one('#resume-all', m.Button).disabled
+            app.start_resume(['file'])
+            assert not app.downloading
+            assert not (tmp_path / JOURNAL_NAME).exists()
+            app.screen.widget('filter', m.Select).value = 'attention'
+            await pilot.pause(.05)
+            assert app.screen.order == ['file']
+            assert not app.screen.query_one('#resume-accept', m.Button).disabled
             await pilot.click('#resume-accept')
             await pilot.pause(.1)
             await wait_for_scan(app, pilot)
             assert app.recovery['file']['status'] == 'complete'
             assert app.downloaded[entry.href] == entry
+            app.screen.widget('filter', m.Select).value = 'all'
+            await pilot.pause(.05)
             assert not app.screen.order
             assert (tmp_path / 'file').read_bytes() == b'done'
     asyncio.run(check())

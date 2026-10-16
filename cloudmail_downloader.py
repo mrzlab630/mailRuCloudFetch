@@ -25,7 +25,7 @@ from download_state import (DownloadJournal, RESERVED_NAMES, inspect_destination
 
 BASE = "https://webdav.cloud.mail.ru/"
 RETRY_DELAYS = (5, 15, 30, 60)
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 def credentials_path():
     if os.name == 'nt':
         directory = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
@@ -613,6 +613,8 @@ class ResumeScreen(DownloadTasksScreen):
         rows = {}
         for key, item in items.items():
             status = item['status']
+            if status == 'found' and self.widget('filter', Select).value != 'attention':
+                continue
             message = item['message'] or RECOVERY_LABELS[status]
             if not self.row_visible(key, message, complete=status == 'complete', temporary=item.get('retryable', False),
                                     error=status == 'error', stopped=status == 'stopped',
@@ -620,7 +622,7 @@ class ResumeScreen(DownloadTasksScreen):
             rows[key] = ('[✓]' if key in self.checked else '[ ]' if key in selectable else '', key, message,
                          f"{size(item['done'])} / {size(item['total'])}", RECOVERY_LABELS[status])
         self.apply_rows(rows, selectable)
-        pending = [item for item in items.values() if item['status'] != 'complete']
+        pending = [item for item in items.values() if item['status'] not in ('complete', 'found')]
         resumable = [item for item in pending if item['can_resume']]
         remaining = sum(max(0, (item['total'] or 0) - item['done']) for item in resumable)
         summary = 'Проверяю папку и облако…' if self.owner.recovery_scanning else (
@@ -920,7 +922,7 @@ class CloudApp(App):
             elif status == 'Ошибка': item.update(status='error', retryable=self.error_retryable.get(href, False))
             elif status == 'Остановлено': item['status'] = 'stopped'
             elif self.downloading: item['status'] = 'active'
-        pending = [item for item in self.recovery.values() if item['status'] != 'complete']
+        pending = [item for item in self.recovery.values() if item['status'] not in ('complete', 'found')]
         widget = self.query_one('#resume-info', Static)
         widget.set_class(bool(pending or self.recovery_error), 'active')
         partial = sum(item['status'] == 'partial' for item in pending)

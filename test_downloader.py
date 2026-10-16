@@ -64,6 +64,9 @@ def test_tui_and_recursive_selection():
                 assert (Path(directory)/'folder/a').read_bytes()==b'test'
                 assert app.total==4
                 assert not app.selected
+                folder_row = app.query_one(m.DataTable).get_row('/folder')
+                assert folder_row[1].style == '#7f8793'
+                assert folder_row[-1].plain == 'Скачана'
                 app.action_open()
                 await pilot.pause(.2)
                 assert app.query_one(m.DataTable).get_row('/folder/a')[1].style == '#7f8793'

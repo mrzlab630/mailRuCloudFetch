@@ -438,6 +438,126 @@ def test_journal_rejects_external_or_reserved_targets(tmp_path, relative):
     with pytest.raises(ValueError): target_path(tmp_path, relative)
 
 
+def test_folder_completion_is_recursive_and_rechecked_after_restart(tmp_path):
+    folder = m.Entry('/archive', 'archive', True)
+    nested = m.Entry('/archive/nested', 'nested', True)
+    empty = m.Entry('/archive/empty', 'empty', True)
+    file = m.Entry('/archive/nested/file', 'file', False, 4, etag='"v1"')
+    calls = Counter()
+    tree = {'/': [folder], folder.href: [nested, empty], nested.href: [file], empty.href: []}
+    class Fake:
+        auth = ('folders-account', 'key')
+        def list(self, path):
+            calls[path] += 1
+            return tree[path]
+    target = tmp_path / 'archive/nested/file'
+    target.parent.mkdir(parents=True)
+    (tmp_path / 'archive/empty').mkdir()
+    target.write_bytes(b'done')
+    journal = DownloadJournal(tmp_path, source_id(m.BASE, Fake()))
+    journal.register([(file, target)])
+    journal.update(target, 'complete', published=target)
+
+    async def check():
+        for restart in range(2):
+            app = m.CloudApp(Fake())
+            async with app.run_test(size=(80, 24)) as pilot:
+                app.query_one('#destination', m.Input).value = str(tmp_path)
+                await wait_for_scan(app, pilot)
+                table = app.query_one('#table', m.DataTable)
+                row = table.get_row(folder.href)
+                assert row[1].style == '#7f8793'
+                assert row[-1].plain == 'Скачана'
+                assert set(app.recovery) == {'archive/nested/file'}
+                assert str(app.query_one('#show-resume', m.Button).label) == 'Докачка'
+                app.action_open()
+                await pilot.pause(.1)
+                await wait_for_scan(app, pilot)
+                for entry in (nested, empty):
+                    assert table.get_row(entry.href)[1].style == '#7f8793'
+                assert calls['/archive'] == restart + 1
+                assert calls['/archive/nested'] == restart + 1
+                assert calls['/archive/empty'] == restart + 1
+                if restart:
+                    app.action_back()
+                    await pilot.pause(.1)
+                    await wait_for_scan(app, pilot)
+                    target.unlink()
+                    app.schedule_recovery_scan()
+                    await wait_for_scan(app, pilot)
+                    row = table.get_row(folder.href)
+                    assert row[1].style == '#e5c07b'
+                    assert row[-1].plain == 'Частично'
+                    assert app.recovery['archive/nested/file']['can_resume']
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize('relative', ['remote/album', 'album'])
+def test_folder_scan_recognizes_legacy_nested_files_without_adoption(tmp_path, relative):
+    folder = m.Entry('/remote/album', 'album', True)
+    nested = m.Entry('/remote/album/nested', 'nested', True)
+    file = m.Entry('/remote/album/nested/file', 'file', False, 4, etag='"v1"')
+    target = tmp_path / relative / 'nested/file'
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b'done')
+    tree = {folder.href: [nested], nested.href: [file]}
+    folders = m.inspect_folders(tmp_path, [folder], {}, tree.__getitem__)
+    assert folders[folder.href]['status'] == 'found'
+    assert folders[nested.href]['status'] == 'found'
+    assert not (tmp_path / JOURNAL_NAME).exists()
+    assert target.read_bytes() == b'done'
+    # A same-named file outside the mapped subtree cannot complete the folder.
+    target.unlink()
+    (tmp_path / 'file').write_bytes(b'done')
+    folders = m.inspect_folders(tmp_path, [folder], {}, tree.__getitem__)
+    assert folders[folder.href]['status'] == 'partial'
+    # Ambiguous full-path versus flattened copies must not be treated as confirmed.
+    alternative = tmp_path / ('album' if relative == 'remote/album' else 'remote/album')
+    alternative.mkdir(parents=True)
+    folders = m.inspect_folders(tmp_path, [folder], {}, tree.__getitem__)
+    assert folders[folder.href]['status'] == 'attention'
+
+
+@pytest.mark.parametrize('problem', ['changed', 'short', 'symlink', 'missing-empty', 'new-file', 'new-folder', 'unavailable'])
+def test_folder_scan_never_confirms_incomplete_or_unchecked_trees(tmp_path, problem):
+    folder = m.Entry('/archive', 'archive', True)
+    nested = m.Entry('/archive/nested', 'nested', True)
+    empty = m.Entry('/archive/empty', 'empty', True)
+    file = m.Entry('/archive/nested/file', 'file', False, 4, etag='"v1"')
+    target = tmp_path / 'archive/nested/file'
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b'done')
+    (tmp_path / 'archive/empty').mkdir()
+    journal = DownloadJournal(tmp_path, 'account')
+    journal.register([(file, target)])
+    journal.update(target, 'complete', published=target)
+    tree = {'/': [folder], folder.href: [nested, empty], nested.href: [file], empty.href: []}
+    def listing(path):
+        if problem == 'unavailable' and path == nested.href:
+            raise OSError('listing unavailable')
+        return tree[path]
+    if problem == 'changed':
+        tree[nested.href] = [m.Entry(file.href, file.name, False, 4, etag='"v2"')]
+    elif problem == 'short':
+        target.write_bytes(b'd')
+    elif problem == 'symlink':
+        target.unlink()
+        outside = tmp_path / 'outside'
+        outside.write_bytes(b'done')
+        target.symlink_to(outside)
+    elif problem == 'missing-empty':
+        (tmp_path / 'archive/empty').rmdir()
+    elif problem == 'new-file':
+        tree[nested.href].append(m.Entry('/archive/nested/new', 'new', False, 4, etag='"v1"'))
+    elif problem == 'new-folder':
+        tree[folder.href].append(m.Entry('/archive/new', 'new', True))
+    files = inspect_destination(tmp_path, 'account', [folder], listing)
+    folders = m.inspect_folders(tmp_path, [folder], files, listing)
+    assert folders[folder.href]['status'] in ('partial', 'attention')
+    assert folders[folder.href]['status'] != 'complete'
+    assert m.inspect_folders(tmp_path, [folder], files, listing, lambda: True) == {}
+
+
 def test_journal_does_not_follow_symlink_or_write_on_scan(tmp_path):
     outside = tmp_path / 'outside'
     outside.mkdir()
@@ -450,9 +570,10 @@ def test_journal_does_not_follow_symlink_or_write_on_scan(tmp_path):
     assert not (outside / 'journal').exists()
 
 
-def test_background_scan_does_not_freeze_or_apply_old_destination(tmp_path, monkeypatch):
+@pytest.mark.parametrize('stage', ['inspect_destination', 'inspect_folders'])
+def test_background_scan_does_not_freeze_or_apply_old_destination(tmp_path, monkeypatch, stage):
     entered, release = threading.Event(), threading.Event()
-    original = m.inspect_destination
+    original = getattr(m, stage)
     first, second = tmp_path / 'first', tmp_path / 'second'
     first.mkdir(); second.mkdir()
     def slow(destination, *args):
@@ -460,7 +581,7 @@ def test_background_scan_does_not_freeze_or_apply_old_destination(tmp_path, monk
             entered.set()
             assert release.wait(5)
         return original(destination, *args)
-    monkeypatch.setattr(m, 'inspect_destination', slow)
+    monkeypatch.setattr(m, stage, slow)
     class Fake:
         def list(self, path): return []
     async def check():

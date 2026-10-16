@@ -274,3 +274,76 @@ def inspect_destination(destination, source, visible, list_remote, cancelled=lam
         except (OSError, ValueError, KeyError, TypeError) as exc:
             item.update(status='attention', message=str(exc))
     return result
+
+
+def inspect_folders(destination, visible, files, list_remote, cancelled=lambda: False):
+    """Check mapped local directory trees without adding folders to the recovery queue."""
+    result = {}
+    priority = {'complete': 0, 'found': 1, 'partial': 2, 'error': 3, 'attention': 4}
+    for root in visible:
+        if cancelled(): return {}
+        if not root.directory: continue
+        candidates, unsafe = [], False
+        parts = PurePosixPath(root.href).parts[1:]
+        for start in range(len(parts)):
+            relative = PurePosixPath(*parts[start:])
+            try:
+                target = target_path(destination, relative)
+                if target.is_dir(): candidates.append(relative)
+                elif target.exists(): unsafe = True
+            except (OSError, ValueError):
+                unsafe = True
+        if not candidates and not unsafe: continue
+        item = dict(entry=asdict(root), status='attention', message='Не удалось однозначно сопоставить папку на диске')
+        result[root.href] = item
+        if len(candidates) != 1: continue
+        stack = [(root, candidates[0], item, None)]
+        while stack:
+            if cancelled(): return {}
+            entry, relative, item, children = stack.pop()
+            if children is not None:
+                item['status'] = max((child['status'] for child in children), key=priority.get, default='complete')
+                item['message'] = ''
+                continue
+            try:
+                target = target_path(destination, relative)
+                if not target.is_dir():
+                    item.update(status='partial', message='Подпапка отсутствует на диске')
+                    continue
+                entries = list_remote(entry.href)
+                children = []
+                descendants = []
+                for child in entries:
+                    if cancelled(): return {}
+                    if PurePosixPath(child.href).parent != PurePosixPath(entry.href) or child.name != PurePosixPath(child.href).name:
+                        raise ValueError('Некорректный путь вложенного объекта в облаке')
+                    child_relative = relative / child.name
+                    child_item = dict(entry=asdict(child), status='attention', message='')
+                    children.append(child_item)
+                    if child.directory:
+                        result[child.href] = child_item
+                        descendants.append((child, child_relative, child_item, None))
+                        continue
+                    try:
+                        local = signature(target_path(destination, child_relative))
+                        record = files.get(child_relative.as_posix(), {})
+                        if record and (not record.get('entry') or not same_version(record['entry'], asdict(child))):
+                            status = 'attention'
+                        elif record.get('status') in ('attention', 'error'):
+                            status = record['status']
+                        elif local is None:
+                            status = 'partial'
+                        elif child.bytes is None or local[0] != child.bytes:
+                            status = 'partial' if child.bytes is not None and local[0] < child.bytes else 'attention'
+                        elif record.get('status') == 'complete':
+                            status = 'complete' if local == (record.get('local_size'), record.get('local_mtime')) else 'attention'
+                        else:
+                            status = 'found'
+                        child_item['status'] = status
+                    except (OSError, ValueError):
+                        child_item['status'] = 'attention'
+                stack.append((entry, relative, item, children))
+                stack.extend(descendants)
+            except Exception:
+                item.update(status='attention', message='Не удалось проверить содержимое папки')
+    return result

@@ -20,12 +20,12 @@ from textual.screen import ModalScreen
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Input, Label, ProgressBar, Select, Static, DataTable, Button
 from textual import work
-from download_state import (DownloadJournal, RESERVED_NAMES, inspect_destination, remember_destination,
+from download_state import (DownloadJournal, RESERVED_NAMES, inspect_destination, inspect_folders, remember_destination,
                             saved_destination, signature, source_id, target_path)
 
 BASE = "https://webdav.cloud.mail.ru/"
 RETRY_DELAYS = (5, 15, 30, 60)
-__version__ = "1.7.1"
+__version__ = "1.8.0"
 def credentials_path():
     if os.name == 'nt':
         directory = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
@@ -882,8 +882,12 @@ class CloudApp(App):
         try:
             if not raw: raise ValueError('Укажите папку назначения')
             destination = Path(raw).expanduser().resolve()
+            visible = list(self.entries)
             snapshot = await asyncio.to_thread(inspect_destination, destination, source_id(BASE, dav),
-                                               list(self.entries), listings.list, cancelled.is_set)
+                                               visible, listings.list, cancelled.is_set)
+            if cancelled.is_set() or self.downloading or dav is not self.dav: return
+            folders = await asyncio.to_thread(inspect_folders, destination, visible, snapshot,
+                                              listings.list, cancelled.is_set)
             if cancelled.is_set() or self.downloading or dav is not self.dav: return
             if destination.is_dir():
                 await asyncio.to_thread(remember_destination, SESSION_STATE, source_id(BASE, dav), destination)
@@ -891,6 +895,7 @@ class CloudApp(App):
             self.recovery = snapshot
             self.resume_active = {}
             self.recovery_by_href = {item['entry']['href']: item for item in snapshot.values() if item['entry']}
+            self.recovery_by_href.update(folders)
             self.recovery_destination = destination
             self.recovery_dav = dav
             self.recovery_error = ''
@@ -1106,8 +1111,8 @@ class CloudApp(App):
         self.update_summary()
         self.query_one('#hint',Static).update('' if self.entries else 'Папка пуста')
     def entry_cells(self, entry):
-        complete = not entry.directory and self.downloaded.get(entry.href) == entry
         item = self.recovery_by_href.get(entry.href, {})
+        complete = self.downloaded.get(entry.href) == entry or (entry.directory and item.get('status') == 'complete')
         style = '#7f8793' if complete else ''
         if not complete and item.get('status') in ('partial', 'found', 'attention'): style = '#e5c07b'
         if not complete and item.get('status') == 'error': style = '#e06c75'
@@ -1115,7 +1120,9 @@ class CloudApp(App):
                   'Папка' if entry.directory else size(entry.bytes),
                   'Папка' if entry.directory else (entry.content_type or Path(entry.name).suffix or 'Файл'),
                   entry.created or '—', entry.modified or '—',
-                  'Скачан' if complete else RECOVERY_LABELS.get(item.get('status'), ''))
+                  ('Скачана' if entry.directory else 'Скачан') if complete else
+                  'Найдена на диске' if entry.directory and item.get('status') == 'found' else
+                  RECOVERY_LABELS.get(item.get('status'), ''))
         return [Text(value, style=style) for value in values]
 
     def mark_downloaded(self, entry):
@@ -1465,10 +1472,15 @@ class CloudApp(App):
     def clear_completed_folders(self, entries):
         table = self.query_one(DataTable)
         for entry in entries:
+            self.recovery_by_href[entry.href] = dict(
+                entry=asdict(entry), status='complete', done=0,
+                total=None, can_resume=False, can_accept=False, message='Скачана',
+            )
             if self.selected.get(entry.href) == entry:
                 self.selected.pop(entry.href)
-                if any(e.href == entry.href for e in self.entries):
-                    table.update_cell(entry.href,next(iter(table.columns)),self.entry_cells(entry)[0])
+            if any(e.href == entry.href for e in self.entries):
+                for column, cell in zip(table.columns, self.entry_cells(entry)):
+                    table.update_cell(entry.href, column, cell)
         self.update_summary()
     def progress(self):
         if not self.query('#transfer-status'): return

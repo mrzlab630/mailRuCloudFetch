@@ -25,7 +25,7 @@ from download_state import (DownloadJournal, RESERVED_NAMES, inspect_destination
 
 BASE = "https://webdav.cloud.mail.ru/"
 RETRY_DELAYS = (5, 15, 30, 60)
-__version__ = "1.8.1"
+__version__ = "1.9.0"
 def credentials_path():
     if os.name == 'nt':
         directory = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
@@ -673,6 +673,9 @@ class CloudApp(App):
     #toolbar { height: 1; padding: 0 1; background: #151b23; }
     #toolbar Button { margin-left: 1; }
     #summary { width: 1fr; height: 1; color: $text-muted; }
+    #sync-row { height: 1; padding: 0 1; }
+    #sync-status { width: 1fr; height: 1; color: $text-muted; }
+    #sync { width: 13; margin-left: 1; }
     #destination-row { height: 1; margin: 1 1 0 1; }
     #destination-label { width: 19; height: 1; }
     Input { height: 1; border: none; padding: 0 1; background: #19232d; }
@@ -686,7 +689,7 @@ class CloudApp(App):
     #threads { width: 14; height: 1; border: none; margin-left: 1; }
     #threads SelectCurrent { height: 1; border: none; padding: 0; }
     #user, #key, #master { width: 1fr; }
-    DataTable { height: 1fr; min-height: 4; margin: 1 1 0 1; scrollbar-size: 1 1; }
+    DataTable { height: 1fr; min-height: 4; margin: 0 1; scrollbar-size: 1 1; }
     #details { height: 1; padding: 0 1; color: $text-muted; }
     #selection-info { display: none; height: auto; max-height: 3; padding: 0 1; color: $text-muted; }
     #selection-info.active { display: block; }
@@ -750,6 +753,8 @@ class CloudApp(App):
         self.recovery_destination = None
         self.recovery_dav = None
         self.recovery_scanning = False
+        self.sync_status = 'Сверка не запускалась'
+        self.sync_started = None
         self.recovery_error = ''
         self.recovery_timer = None
         self.recovery_cancel = threading.Event()
@@ -772,6 +777,9 @@ class CloudApp(App):
             yield Label('Папка назначения',id='destination-label')
             yield Input(str(self.dest),placeholder='Введите путь',id='destination')
             yield Select([(f'{n} потоков',n) for n in (1,2,4,8,16)],value=4,allow_blank=False,id='threads')
+        with Horizontal(id='sync-row'):
+            yield Static('Сверка не запускалась', id='sync-status', markup=False)
+            yield Button('Сверить', id='sync')
         with Vertical(id='credentials'):
             yield Static('Доступ · данные хранятся зашифрованно',markup=False)
             with Horizontal():
@@ -802,10 +810,10 @@ class CloudApp(App):
     def on_mount(self):
         self.title='MAIL CLOUD · WebDAV'; self.set_interval(.25,self.progress)
         self.update_summary()
-        if self.dav is not None: self.load()
+        if self.dav is not None: self.load(sync=True)
         else: self.query_one('#hint',Static).update('Откройте «Доступ», чтобы разблокировать или сохранить credentials')
         if self.session_error: self.notify(self.session_error, severity='warning')
-        self.schedule_recovery_scan()
+        self.render_sync_status()
     def update_summary(self):
         if self.listings.dav is not self.dav:
             self.listings = DirectoryIndex(self.dav)
@@ -864,59 +872,149 @@ class CloudApp(App):
             self.recovery.clear()
             self.recovery_by_href.clear()
             self.redraw_entry_states()
-            self.schedule_recovery_scan()
+            self.load(sync=True)
 
-    def schedule_recovery_scan(self):
-        self.recovery_cancel.set()
-        self.recovery_cancel = threading.Event()
+    def schedule_recovery_scan(self, recursive=True, cancelled=None):
+        if cancelled is None:
+            self.recovery_cancel.set()
+            self.recovery_cancel = threading.Event()
+            cancelled = self.recovery_cancel
+            self.sync_started = time.monotonic()
+        elif cancelled is not self.recovery_cancel or cancelled.is_set():
+            return
         if self.recovery_timer is not None: self.recovery_timer.stop()
         self.recovery_scanning = False
-        if self.downloading or self.dav is None or self.quitting: return
+        if self.downloading or self.dav is None or self.quitting:
+            self.render_sync_status()
+            return
         self.recovery_scanning = True
-        self.recovery_timer = self.set_timer(.2, self.scan_recovery)
+        self.recovery_error = ''
+        self.sync_status = 'Сверка файлов…' if recursive else 'Проверка текущего каталога…'
+        self.render_sync_status()
+        self.recovery_timer = self.set_timer(.2, lambda: self.scan_recovery(recursive, cancelled))
+
+    def render_sync_status(self):
+        if not self.query('#sync-status'): return
+        label = self.sync_status
+        if self.recovery_scanning:
+            frame = '◐◓◑◒'[int(time.monotonic() * 4) % 4]
+            elapsed = int(time.monotonic() - (self.sync_started or time.monotonic()))
+            label = f'{frame} {elapsed} с · {label}'
+        elif self.downloading: label = 'Загрузка · сверка после завершения'
+        elif self.dav is None: label = 'Сверка недоступна: откройте «Доступ»'
+        elif self.recovery_error: label = f'Ошибка сверки: {self.recovery_error}'
+        self.query_one('#sync-status', Static).update(label)
+        button = self.query_one('#sync', Button)
+        button.label = 'Остановить' if self.recovery_scanning else 'Сверить'
+        button.disabled = self.dav is None or self.downloading
+
+    def action_sync(self):
+        if self.dav is None:
+            self.query_one('#hint', Static).update('Сначала разблокируйте credentials')
+            return
+        if self.downloading:
+            self.notify('Сначала остановите загрузку', severity='warning')
+            return
+        self.recovery_cancel.set()
+        if self.recovery_timer is not None: self.recovery_timer.stop()
+        if self.recovery_scanning:
+            self.recovery_scanning = False
+            self.sync_status = 'Сверка прервана · результат неполный'
+            self.recovery_error = ''
+            self.render_sync_status()
+            self.render_recovery()
+            return
+        self.listings = DirectoryIndex(self.dav)
+        self.load(sync=True)
 
     @work(exclusive=True, group='recovery-scan')
-    async def scan_recovery(self):
-        dav, listings, cancelled = self.dav, self.listings, self.recovery_cancel
+    async def scan_recovery(self, recursive=True, cancelled=None):
+        cancelled = cancelled or self.recovery_cancel
+        if cancelled.is_set() or cancelled is not self.recovery_cancel: return
+        dav, listings = self.dav, self.listings
         raw = self.query_one('#destination', Input).value.strip()
+        phase, checked, reported = 'Файлы', set(), 0.
+        def report(path):
+            if cancelled.is_set(): return
+            self.sync_status = f'{phase}: проверено папок {len(checked)} · {path}'
+            self.render_sync_status()
+        def checked_list(path):
+            nonlocal reported
+            if cancelled.is_set(): return ()
+            if time.monotonic() - reported >= .25:
+                self.call_from_thread(report, path)
+                reported = time.monotonic()
+            entries = listings.list(path)
+            checked.add(path)
+            return entries
         try:
             if not raw: raise ValueError('Укажите папку назначения')
             destination = Path(raw).expanduser().resolve()
             visible = list(self.entries)
             snapshot = await asyncio.to_thread(inspect_destination, destination, source_id(BASE, dav),
-                                               visible, listings.list, cancelled.is_set)
+                                               visible, checked_list, cancelled.is_set, not recursive)
             if cancelled.is_set() or self.downloading or dav is not self.dav: return
             if destination.is_dir():
                 await asyncio.to_thread(remember_destination, SESSION_STATE, source_id(BASE, dav), destination)
             if cancelled.is_set() or self.downloading or dav is not self.dav: return
-            self.recovery = snapshot
+            if recursive:
+                self.recovery = snapshot
+                self.recovery_by_href = {}
+                self.downloaded = {}
+            else:
+                hrefs = {entry.href for entry in visible if not entry.directory}
+                self.recovery = {key: item for key, item in self.recovery.items()
+                                 if not item.get('entry') or item['entry']['href'] not in hrefs}
+                for href in hrefs:
+                    self.recovery_by_href.pop(href, None)
+                    self.downloaded.pop(href, None)
+                self.recovery.update(snapshot)
+                # A changed child invalidates an earlier successful folder scan.
+                verified = {item['entry']['href'] for item in snapshot.values()
+                            if item.get('entry') and item['status'] == 'complete'}
+                ancestors = set()
+                for href in hrefs - verified:
+                    path = PurePosixPath(href)
+                    ancestors.update(str(parent) for parent in path.parents if str(parent) != '/')
+                for folder_href, item in self.recovery_by_href.items():
+                    if folder_href in ancestors and item.get('entry', {}).get('directory') and item['status'] == 'complete':
+                        item.update(status='attention', message='Содержимое папки требует полной сверки')
             self.resume_active = {}
-            self.recovery_by_href = {item['entry']['href']: item for item in snapshot.values() if item['entry']}
+            self.recovery_by_href.update({item['entry']['href']: item for item in snapshot.values() if item['entry']})
             self.recovery_destination = destination
             self.recovery_dav = dav
             self.recovery_error = ''
-            self.downloaded = {item['entry']['href']: Entry(**item['entry']) for item in snapshot.values()
-                               if item['status'] == 'complete'}
+            self.downloaded.update({item['entry']['href']: Entry(**item['entry']) for item in snapshot.values()
+                                    if item['status'] == 'complete'})
             self.redraw_entry_states()
             self.render_recovery()
-            folders = await asyncio.to_thread(inspect_folders, destination, visible, snapshot,
-                                              listings.list, cancelled.is_set)
-            if cancelled.is_set() or self.downloading or dav is not self.dav: return
-            self.recovery_by_href.update(folders)
-            self.redraw_entry_states()
+            if recursive:
+                phase = 'Папки'
+                self.sync_status = 'Сверка папок и подпапок…'
+                self.render_sync_status()
+                folders = await asyncio.to_thread(inspect_folders, destination, visible, snapshot,
+                                                  checked_list, cancelled.is_set)
+                if cancelled.is_set() or self.downloading or dav is not self.dav: return
+                self.recovery_by_href.update(folders)
+                self.redraw_entry_states()
+            self.sync_status = ('Сверка завершена' if recursive else 'Каталог проверен') + f' · папок {len(checked)}' + time.strftime(' · %H:%M:%S')
         except Exception as exc:
-            if not cancelled.is_set(): self.recovery_error = self.err(exc)
+            if not cancelled.is_set():
+                self.recovery_error = self.err(exc)
+                self.sync_status = 'Ошибка сверки'
         finally:
             if not cancelled.is_set():
                 self.recovery_scanning = False
                 self.render_recovery()
+                self.render_sync_status()
 
     def redraw_entry_states(self):
         table = self.query_one('#table', DataTable)
         for entry in self.entries:
             if entry.href not in table.rows: continue
-            for column, cell in zip(table.columns, self.entry_cells(entry)):
-                table.update_cell(entry.href, column, cell)
+            for column, cell, old in zip(table.columns, self.entry_cells(entry), table.get_row(entry.href)):
+                if cell != old or cell.style != old.style:
+                    table.update_cell(entry.href, column, cell)
 
     def render_recovery(self):
         if not self.query('#resume-info'): return
@@ -1088,8 +1186,19 @@ class CloudApp(App):
         for value in self.credentials.values():
             if value: text = text.replace(value, '[скрыто]')
         return text[:200]
+    def load(self, sync=False):
+        self.recovery_cancel.set()
+        self.recovery_cancel = threading.Event()
+        if self.recovery_timer is not None: self.recovery_timer.stop()
+        self.recovery_scanning = self.dav is not None and not self.downloading and not self.quitting
+        self.sync_started = time.monotonic()
+        self.sync_status = 'Читаю текущий каталог…'
+        self.recovery_error = ''
+        self.render_sync_status()
+        return self.load_directory(sync, self.recovery_cancel)
+
     @work(exclusive=True,group='load')
-    async def load(self):
+    async def load_directory(self, sync, cancelled):
         if self.dav is None: return
         dav = self.dav
         listings = self.listings
@@ -1097,15 +1206,24 @@ class CloudApp(App):
         try:
             entries=await asyncio.to_thread(listings.list,path)
             if dav is self.dav and listings is self.listings and path == self.path:
+                changed = entries != self.entries
                 self.entries=entries
                 for e in entries:
                     if e.href in self.selected: self.selected[e.href]=e
                 self.selection_signature=None
-                self.refresh_table()
-                self.schedule_recovery_scan()
+                if changed: self.refresh_table()
+                else:
+                    self.redraw_entry_states()
+                    self.update_summary()
+                self.schedule_recovery_scan(recursive=sync, cancelled=cancelled)
         except Exception as e:
             if dav is self.dav and listings is self.listings and path == self.path:
                 self.query_one('#hint',Static).update(self.err(e))
+                if not cancelled.is_set():
+                    cancelled.set()
+                    self.recovery_scanning = False
+                    self.recovery_error = self.err(e)
+                    self.render_sync_status()
     def refresh_table(self):
         self.query_one('#details',Static).update('')
         t=self.query_one(DataTable); t.clear(columns=True); t.add_columns(' ','Имя','Размер','Тип','Создано','Изменено','Состояние')
@@ -1114,7 +1232,8 @@ class CloudApp(App):
         self.query_one('#hint',Static).update('' if self.entries else 'Папка пуста')
     def entry_cells(self, entry):
         item = self.recovery_by_href.get(entry.href, {})
-        complete = self.downloaded.get(entry.href) == entry or (entry.directory and item.get('status') == 'complete')
+        if item and item.get('entry') != asdict(entry): item = {}
+        complete = self.downloaded.get(entry.href) == entry or item.get('status') == 'complete'
         style = '#7f8793' if complete else ''
         if not complete and item.get('status') in ('partial', 'found', 'attention'): style = '#e5c07b'
         if not complete and item.get('status') == 'error': style = '#e06c75'
@@ -1186,6 +1305,7 @@ class CloudApp(App):
         elif event.button.id == 'save-credentials': self.save_credentials()
         elif event.button.id == 'unlock-credentials': self.unlock_credentials()
         elif event.button.id == 'refresh': self.action_refresh()
+        elif event.button.id == 'sync': self.action_sync()
         elif event.button.id == 'toggle-credentials': self.toggle_panel('credentials')
         elif event.button.id == 'pause-download': self.action_pause()
         elif event.button.id == 'stop-download': self.action_stop()
@@ -1208,7 +1328,7 @@ class CloudApp(App):
             self.restore_destination()
             self.query_one('#user', Input).value = credentials['MAIL_CLOUD_USER']
             self.query_one('#key', Input).value = credentials['MAIL_CLOUD_WEBDAV_KEY']
-            self.selected.clear(); self.entries=[]; self.states={}; self.path='/'; self.refresh_table(); self.load()
+            self.selected.clear(); self.entries=[]; self.states={}; self.path='/'; self.refresh_table(); self.load(sync=True)
             self.measured_speed=0; self.query_one('#transfer').remove_class('active')
             self.query_one('#hint', Static).update('Credentials расшифрованы только в памяти процесса')
         except (OSError, ValueError) as exc:
@@ -1232,7 +1352,7 @@ class CloudApp(App):
             self.credentials = {'MAIL_CLOUD_USER': user, 'MAIL_CLOUD_WEBDAV_KEY': key}
             self.dav = DAV(user, key)
             self.restore_destination()
-            self.selected.clear(); self.entries=[]; self.states={}; self.path = '/'; self.refresh_table(); self.load()
+            self.selected.clear(); self.entries=[]; self.states={}; self.path = '/'; self.refresh_table(); self.load(sync=True)
             self.measured_speed=0; self.query_one('#transfer').remove_class('active')
             self.update_summary()
             self.query_one('#hint', Static).update('Доступ сохранён зашифрованно. Открываю корень Mail Cloud…')
@@ -1488,6 +1608,7 @@ class CloudApp(App):
         if not self.query('#transfer-status'): return
         self.render_selection()
         self.render_recovery()
+        self.render_sync_status()
         with self.lock:
             if not self.states: return
             done=sum(v[0] for v in self.states.values()); total=sum(v[1] or 0 for v in self.states.values()); unknown=sum(v[1] is None for v in self.states.values()); now=time.monotonic()
@@ -1514,6 +1635,9 @@ class CloudApp(App):
             if isinstance(self.screen, DownloadTasksScreen): self.screen.render_transfer()
     async def action_quit(self):
         self.quitting=True
+        self.recovery_cancel.set()
+        if self.recovery_timer is not None: self.recovery_timer.stop()
+        self.recovery_scanning = False
         self.stop.set(); self.paused=False
         if self.downloading:
             self.notify('Останавливаю потоки и сохраняю .part…',timeout=5)

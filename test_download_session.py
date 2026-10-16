@@ -654,3 +654,155 @@ def test_background_scan_does_not_freeze_or_apply_old_destination(tmp_path, monk
         asyncio.run(check())
     finally:
         release.set()
+
+
+def test_navigation_checks_camera_files_without_recursive_rescan(tmp_path, monkeypatch):
+    folder = m.Entry('/Camera Uploads', 'Camera Uploads', True)
+    nested = m.Entry('/Camera Uploads/nested', 'nested', True)
+    file = m.Entry('/Camera Uploads/file', 'file', False, 4, etag='"v1"')
+    entries = [file, nested]
+    calls, folder_scans = Counter(), []
+    original = m.inspect_folders
+    def folders(*args):
+        folder_scans.append(True)
+        return original(*args)
+    monkeypatch.setattr(m, 'inspect_folders', folders)
+    class Fake:
+        def list(self, path):
+            calls[path] += 1
+            return [folder] if path == '/' else entries[:] if path == folder.href else []
+    target = tmp_path / 'Camera Uploads/file'
+    target.parent.mkdir()
+    (target.parent / 'nested').mkdir()
+    target.write_bytes(b'done')
+    journal = DownloadJournal(tmp_path, source_id(m.BASE, Fake()))
+    journal.register([(file, target)])
+    journal.update(target, 'complete', published=target)
+    async def check():
+        app = m.CloudApp(Fake())
+        app.dest = tmp_path
+        async with app.run_test(size=(80, 24)) as pilot:
+            await wait_for_scan(app, pilot)
+            assert folder_scans == [True]
+            table = app.query_one('#table', m.DataTable)
+            assert table.get_row(folder.href)[1].style == '#7f8793'
+            app.action_open()
+            assert app.recovery_scanning
+            await wait_for_scan(app, pilot)
+            assert folder_scans == [True]
+            assert calls == {'/': 1, folder.href: 1, nested.href: 1}
+            assert table.get_row(file.href)[1].style == '#7f8793'
+            assert table.get_row(nested.href)[1].style == '#7f8793'
+            assert 'Каталог проверен' in app.sync_status
+            # The explicit command also refreshes cloud metadata, not just the cache.
+            entries[0] = m.Entry(file.href, file.name, False, 5, etag='"v2"')
+            await pilot.click('#sync')
+            await wait_for_scan(app, pilot)
+            assert folder_scans == [True, True]
+            assert calls[folder.href] == 2
+            assert table.get_row(file.href)[1].style != '#7f8793'
+            assert file.href not in app.downloaded
+            assert 'Сверка завершена' in app.sync_status
+    asyncio.run(check())
+
+
+def test_quick_scan_invalidates_stale_parent_folder_mark(tmp_path):
+    folder = m.Entry('/folder', 'folder', True)
+    file = m.Entry('/folder/file', 'file', False, 4, etag='"v1"')
+    class Fake:
+        def list(self, path): return [folder] if path == '/' else [file]
+    target = tmp_path / 'folder/file'
+    target.parent.mkdir()
+    target.write_bytes(b'done')
+    journal = DownloadJournal(tmp_path, source_id(m.BASE, Fake()))
+    journal.register([(file, target)])
+    journal.update(target, 'complete', published=target)
+    async def check():
+        app = m.CloudApp(Fake())
+        app.dest = tmp_path
+        async with app.run_test(size=(80, 24)) as pilot:
+            await wait_for_scan(app, pilot)
+            assert app.entry_cells(folder)[1].style == '#7f8793'
+            target.unlink()
+            app.action_open()
+            await wait_for_scan(app, pilot)
+            app.action_back()
+            await wait_for_scan(app, pilot)
+            row = app.query_one('#table', m.DataTable).get_row(folder.href)
+            assert row[1].style == '#e5c07b'
+            assert row[-1].plain == 'Требует проверки'
+            await pilot.click('#sync')
+            await wait_for_scan(app, pilot)
+            row = app.query_one('#table', m.DataTable).get_row(folder.href)
+            assert row[1].style == '#e5c07b'
+            assert row[-1].plain == 'Частично'
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize('stage', ['load', 'inspect_destination', 'inspect_folders'])
+def test_sync_indicator_and_stop_discard_late_results(tmp_path, monkeypatch, stage):
+    folder = m.Entry('/Camera Uploads', 'Camera Uploads', True)
+    file = m.Entry('/file', 'file', False, 4, etag='"v1"')
+    entered, release, blocking, finished = (threading.Event() for _ in range(4))
+    (tmp_path / folder.name).mkdir()
+    target = tmp_path / file.name
+    target.write_bytes(b'done')
+    class Fake:
+        def list(self, path):
+            if stage == 'load' and path == '/' and blocking.is_set():
+                entered.set()
+                assert release.wait(5)
+                finished.set()
+            return [folder, file] if path == '/' else []
+    if stage != 'load':
+        original = getattr(m, stage)
+        def slow(*args):
+            result = original(*args)
+            if blocking.is_set():
+                entered.set()
+                assert release.wait(5)
+                finished.set()
+            return result
+        monkeypatch.setattr(m, stage, slow)
+    journal = DownloadJournal(tmp_path, source_id(m.BASE, Fake()))
+    journal.register([(file, target)])
+    journal.update(target, 'complete', published=target)
+    async def check():
+        app = m.CloudApp(Fake())
+        app.dest = tmp_path
+        async with app.run_test(size=(80, 24)) as pilot:
+            await wait_for_scan(app, pilot)
+            assert app.downloaded[file.href] == file
+            target.unlink()
+            blocking.set()
+            await pilot.click('#sync')
+            assert await asyncio.to_thread(entered.wait, 2)
+            await pilot.pause(.05)
+            assert app.recovery_scanning
+            status = app.query_one('#sync-status', m.Static)
+            assert ' с' in str(status.render())
+            button = app.query_one('#sync', m.Button)
+            assert str(button.label) == 'Остановить'
+            assert app.screen.region.contains_region(button.region)
+            assert not button.region.overlaps(status.region)
+            assert app.query_one('#table', m.DataTable).region.height >= 16
+            # The network/disk operation is blocked; the rest of the UI still works.
+            await pilot.click('#toggle-credentials')
+            assert app.query_one('#credentials').has_class('open')
+            await pilot.click('#toggle-credentials')
+            snapshot, badges = app.recovery, app.recovery_by_href.copy()
+            await pilot.click('#sync')
+            assert not app.recovery_scanning
+            assert str(button.label) == 'Сверить'
+            assert 'прервана' in str(status.render())
+            release.set()
+            assert await asyncio.to_thread(finished.wait, 2)
+            await pilot.pause(.3)
+            assert not app.recovery_scanning
+            assert app.recovery is snapshot
+            assert app.recovery_by_href == badges
+            assert 'прервана' in str(status.render())
+    try:
+        asyncio.run(check())
+    finally:
+        release.set()

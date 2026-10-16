@@ -153,14 +153,18 @@ class DownloadJournal:
                 (status, message, local[0] if local else None, local[1] if local else None, self.source, relative))
 
 
-def inspect_destination(destination, source, visible, list_remote, cancelled=lambda: False):
+def inspect_destination(destination, source, visible, list_remote, cancelled=lambda: False, visible_only=False):
     """Return a snapshot only. Never adopt, delete, rename, or download local data."""
     if not destination.is_dir():
         return {}
     journal = DownloadJournal(destination, source)
     records = journal.records()
+    if visible_only:
+        hrefs = {entry.href for entry in visible if not entry.directory}
+        records = {key: record for key, record in records.items()
+                   if record['entry'] and record['entry']['href'] in hrefs}
     # Import older partials by their account-bound metadata, without modifying them.
-    for directory, names, files in os.walk(destination, followlinks=False):
+    for directory, names, files in (() if visible_only else os.walk(destination, followlinks=False)):
         if cancelled():
             return {}
         names[:] = [name for name in names if not (Path(directory) / name).is_symlink()]
@@ -205,6 +209,11 @@ def inspect_destination(destination, source, visible, list_remote, cancelled=lam
                 target = target_path(destination, relative)
                 if signature(target) is not None:
                     records[relative] = dict(target=relative, entry=asdict(entry), status='found',
+                                             local_size=None, local_mtime=None, message='')
+                elif visible_only and any(target.with_name(target.name + suffix).exists()
+                                          or target.with_name(target.name + suffix).is_symlink()
+                                          for suffix in ('.part', '.part.json')):
+                    records[relative] = dict(target=relative, entry=asdict(entry), status='queued',
                                              local_size=None, local_mtime=None, message='')
             except (OSError, ValueError):
                 continue

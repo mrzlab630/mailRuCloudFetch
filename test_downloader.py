@@ -448,12 +448,13 @@ def test_dav_rejects_unsafe_paths(href):
     with pytest.raises(ValueError): m.remote_path(href)
 
 
-def test_resume_rejects_other_account_and_invalid_range(tmp_path):
+@pytest.mark.parametrize('separator', [' ', '='])
+def test_resume_rejects_other_account_and_invalid_range(tmp_path, separator):
     class InvalidRange(Handler):
         def do_GET(self):
             if self.headers.get('Range'):
                 self.send_response(206)
-                self.send_header('Content-Range', f'bytes 0-{len(DATA)-1}/{len(DATA)}')
+                self.send_header('Content-Range', f'bytes{separator}0-{len(DATA)-1}/{len(DATA)}')
                 self.send_header('Content-Length', str(len(DATA)))
                 self.end_headers()
                 return
@@ -471,6 +472,30 @@ def test_resume_rejects_other_account_and_invalid_range(tmp_path):
         with pytest.raises(ValueError, match='Content-Range'):
             dav.get(entry, dest, lambda *args: None, lambda: False)
         assert partial.read_bytes() == DATA[:100] and not dest.exists()
+
+
+@pytest.mark.parametrize('separator', [' ', '='])
+def test_resume_accepts_valid_standard_and_mail_content_range(tmp_path, separator):
+    observed = []
+    class MailRange(Handler):
+        def send_header(self, name, value):
+            if name == 'Content-Range': value = value.replace('bytes ', 'bytes' + separator)
+            super().send_header(name, value)
+        def do_GET(self):
+            observed.append(self.headers.get('Range'))
+            super().do_GET()
+    with http_server(MailRange):
+        entry = m.Entry('/file', 'file', False, len(DATA), etag='"v1"')
+        target = tmp_path / 'file'
+        dav = m.DAV('test', 'key')
+        stop = threading.Event()
+        assert not dav.get(entry, target, lambda *args: stop.set(), stop.is_set)
+        partial = target.with_name('file.part')
+        partial.write_bytes(DATA[:123456])
+        assert dav.get(entry, target, lambda *args: None, lambda: False)
+        assert observed == [None, 'bytes=123456-']
+        assert target.read_bytes() == DATA
+        assert not partial.exists()
 
 
 def test_complete_partial_is_revalidated(tmp_path):

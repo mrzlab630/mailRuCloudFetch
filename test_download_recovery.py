@@ -17,6 +17,58 @@ async def wait_for_batch(app, pilot):
     raise AssertionError('Download did not finish')
 
 
+@pytest.mark.parametrize('terminal_size', [(80, 24), (120, 35)])
+def test_error_dialog_selects_files_with_one_click_and_keyboard(tmp_path, terminal_size):
+    async def check():
+        app = m.CloudApp(None)
+        entries = [m.Entry('/' + name, name, False, 4) for name in ('one', 'two', 'three')]
+        async with app.run_test(size=terminal_size) as pilot:
+            for entry in entries:
+                app.error_jobs[entry.href] = (entry, tmp_path / entry.name)
+                app.states[entry.href] = [0, 4, 0, 'Ошибка', 'offline']
+                app.error_retryable[entry.href] = True
+            app.action_show_errors()
+            await pilot.pause(.1)
+            screen = app.screen
+            table = screen.query_one('#error-table', m.DataTable)
+            assert screen.query_one('#retry-selected', m.Button).disabled
+            # Moving to a different cell must select on the first click.
+            await pilot.click('#error-table', offset=(5, 1))
+            assert screen.checked == {'/one'}
+            await pilot.click('#error-table', offset=(1, 2))
+            assert screen.checked == {'/one', '/three'}
+            await pilot.click('#error-table', offset=(5, 2))
+            assert screen.checked == {'/one'}
+            await pilot.click('#error-table', offset=(5, 2))
+            assert screen.checked == {'/one', '/three'}
+            await pilot.click('#error-table', offset=(5, 2))
+            assert screen.checked == {'/one'}
+            await pilot.click('#error-table', offset=(5, 0))
+            assert screen.checked == {'/one'}
+            await pilot.press('space')
+            assert screen.checked == {'/one', '/three'}
+            await pilot.press('down', 'enter')
+            assert screen.checked == {entry.href for entry in entries}
+            screen.refresh_rows()
+            assert screen.checked == {entry.href for entry in entries}
+            assert not screen.query_one('#retry-selected', m.Button).disabled
+            assert str(screen.query_one('#retry-selected', m.Button).label) == 'Отмеченные (3)'
+            # Filters preserve explicitly selected files, including hidden rows.
+            screen.query_one('#error-search', m.Input).value = 'two'
+            await pilot.pause(.1)
+            assert screen.order == ['/two']
+            assert len(screen.checked) == 3
+            table.focus()
+            await pilot.press('enter')
+            assert screen.checked == {'/one', '/three'}
+            screen.query_one('#error-search', m.Input).value = ''
+            await pilot.pause(.1)
+            assert len(screen.order) == 3
+            for selector in ('#retry-current', '#retry-selected', '#retry-all', '#close-errors', '#retry-stop'):
+                assert screen.query_one('#error-dialog').region.contains_region(screen.query_one(selector).region)
+    asyncio.run(check())
+
+
 def test_error_dialog_first_pass_single_selected_and_all_retries(tmp_path, monkeypatch):
     monkeypatch.setattr(m, 'RETRY_DELAYS', (0, 0, 0, 0))
     entries = [m.Entry('/folder/' + name, name, False, 4) for name in ('good', 'one', 'two', 'three', 'denied')]
@@ -77,7 +129,7 @@ def test_error_dialog_first_pass_single_selected_and_all_retries(tmp_path, monke
             assert calls['one'] == 2 and calls['two'] == calls['three'] == calls['good'] == 1
             assert screen is app.screen
             assert app.states['/folder/one'][3] == 'Готово'
-            assert '/folder/one' in screen.order  # Successful recovery remains in the report.
+            assert '/folder/one' not in screen.order
             table.move_cursor(row=screen.order.index('/folder/two'))
             table.focus()
             await pilot.press('space')
@@ -85,10 +137,24 @@ def test_error_dialog_first_pass_single_selected_and_all_retries(tmp_path, monke
             await pilot.click('#retry-selected')
             await wait_for_batch(app, pilot)
             assert calls['two'] == 2 and calls['three'] == 1
+            assert '/folder/two' not in screen.order
+            assert not screen.checked
+            assert screen.query_one('#retry-selected', m.Button).disabled
             await pilot.click('#retry-all')
             await wait_for_batch(app, pilot)
             assert calls['three'] == 2 and calls['good'] == calls['denied'] == 1
             assert 'Готово: 3' in str(screen.query_one('#error-summary').render())
+            assert screen.order == ['/folder/denied']
+            assert screen.query_one('#retry-all', m.Button).disabled
+            screen.query_one('#error-filter', m.Select).value = 'done'
+            await pilot.pause(.1)
+            assert screen.order == ['/folder/one', '/folder/three', '/folder/two']
+            assert screen.query_one('#retry-current', m.Button).disabled
+            table.focus()
+            await pilot.press('space', 'enter')
+            assert not screen.checked
+            screen.query_one('#error-filter', m.Select).value = 'all'
+            await pilot.pause(.1)
             # A permanent error can be retried manually after correction, only once.
             table.move_cursor(row=screen.order.index('/folder/denied'))
             await pilot.click('#retry-current')
@@ -220,6 +286,12 @@ def test_retry_resumes_real_partial_without_recounting_and_clears_folder(tmp_pat
                 assert not app.selected
                 assert isinstance(app.screen, m.ErrorRetryScreen)
                 assert 'Готово: 1' in str(app.screen.query_one('#error-summary').render())
+                assert app.screen.order == []
+                assert app.screen.query_one('#error-table', m.DataTable).row_count == 0
+                assert 'Все файлы успешно скачаны' in str(app.screen.query_one('#error-details').render())
+                assert not app.query_one('#show-errors', m.Button).display
+                for selector in ('#retry-current', '#retry-selected', '#retry-all'):
+                    assert app.screen.query_one(selector, m.Button).disabled
         asyncio.run(check())
 
 

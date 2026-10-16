@@ -570,12 +570,61 @@ def test_journal_does_not_follow_symlink_or_write_on_scan(tmp_path):
     assert not (outside / 'journal').exists()
 
 
+@pytest.mark.parametrize('folder_error', [False, True])
+def test_file_colors_appear_before_slow_folder_scan_finishes(tmp_path, folder_error):
+    folder = m.Entry('/archive', 'archive', True)
+    done = m.Entry('/done', 'done', False, 4, etag='"v1"')
+    found = m.Entry('/found', 'found', False, 4, etag='"v1"')
+    nested = m.Entry('/archive/nested', 'nested', False, 4, etag='"v1"')
+    entered, release = threading.Event(), threading.Event()
+    (tmp_path / 'archive').mkdir()
+    for relative in ('done', 'found', 'archive/nested'):
+        (tmp_path / relative).write_bytes(b'done')
+    class Fake:
+        auth = ('color-account', 'key')
+        def list(self, path):
+            if path == '/': return [folder, done, found]
+            assert path == folder.href
+            entered.set()
+            assert release.wait(5), 'folder listing was not released'
+            if folder_error: raise OSError('folder listing unavailable')
+            return [nested]
+    journal = DownloadJournal(tmp_path, source_id(m.BASE, Fake()))
+    journal.register([(done, tmp_path / 'done')])
+    journal.update(tmp_path / 'done', 'complete', published=tmp_path / 'done')
+    async def check():
+        app = m.CloudApp(Fake())
+        async with app.run_test(size=(100, 28)) as pilot:
+            app.query_one('#destination', m.Input).value = str(tmp_path)
+            try:
+                assert await asyncio.to_thread(entered.wait, 2)
+                await pilot.pause(.05)
+                assert app.recovery_scanning
+                table = app.query_one('#table', m.DataTable)
+                assert table.get_row(done.href)[1].style == '#7f8793'
+                assert table.get_row(done.href)[-1].plain == 'Скачан'
+                assert table.get_row(found.href)[1].style == '#e5c07b'
+                assert table.get_row(found.href)[-1].plain == 'Найден на диске'
+                assert not app.selected
+                assert str(app.query_one('#show-resume', m.Button).label) == 'Докачка'
+            finally:
+                release.set()
+            await wait_for_scan(app, pilot)
+            assert table.get_row(done.href)[1].style == '#7f8793'
+            assert table.get_row(found.href)[1].style == '#e5c07b'
+            assert table.get_row(folder.href)[-1].plain == ('Требует проверки' if folder_error else 'Найдена на диске')
+            assert set(app.recovery) == {'done', 'found'}
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize('stage', ['inspect_destination', 'inspect_folders'])
 def test_background_scan_does_not_freeze_or_apply_old_destination(tmp_path, monkeypatch, stage):
     entered, release = threading.Event(), threading.Event()
     original = getattr(m, stage)
     first, second = tmp_path / 'first', tmp_path / 'second'
     first.mkdir(); second.mkdir()
+    (first / 'file').write_bytes(b'done')
+    entry = m.Entry('/file', 'file', False, 4, etag='"v1"')
     def slow(destination, *args):
         if destination == first:
             entered.set()
@@ -583,7 +632,10 @@ def test_background_scan_does_not_freeze_or_apply_old_destination(tmp_path, monk
         return original(destination, *args)
     monkeypatch.setattr(m, stage, slow)
     class Fake:
-        def list(self, path): return []
+        def list(self, path): return [entry]
+    journal = DownloadJournal(first, source_id(m.BASE, Fake()))
+    journal.register([(entry, first / 'file')])
+    journal.update(first / 'file', 'complete', published=first / 'file')
     async def check():
         app = m.CloudApp(Fake())
         async with app.run_test(size=(80, 24)) as pilot:
@@ -595,6 +647,9 @@ def test_background_scan_does_not_freeze_or_apply_old_destination(tmp_path, monk
             release.set()
             await wait_for_scan(app, pilot)
             assert app.recovery_destination == second
+            assert app.recovery == {}
+            assert app.downloaded == {}
+            assert app.query_one('#table', m.DataTable).get_row(entry.href)[1].style == ''
     try:
         asyncio.run(check())
     finally:

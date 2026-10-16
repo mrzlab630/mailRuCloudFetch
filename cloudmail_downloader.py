@@ -25,7 +25,7 @@ from download_state import (DownloadJournal, RESERVED_NAMES, inspect_destination
 
 BASE = "https://webdav.cloud.mail.ru/"
 RETRY_DELAYS = (5, 15, 30, 60)
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 def credentials_path():
     if os.name == 'nt':
         directory = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
@@ -886,21 +886,23 @@ class CloudApp(App):
             snapshot = await asyncio.to_thread(inspect_destination, destination, source_id(BASE, dav),
                                                visible, listings.list, cancelled.is_set)
             if cancelled.is_set() or self.downloading or dav is not self.dav: return
-            folders = await asyncio.to_thread(inspect_folders, destination, visible, snapshot,
-                                              listings.list, cancelled.is_set)
-            if cancelled.is_set() or self.downloading or dav is not self.dav: return
             if destination.is_dir():
                 await asyncio.to_thread(remember_destination, SESSION_STATE, source_id(BASE, dav), destination)
             if cancelled.is_set() or self.downloading or dav is not self.dav: return
             self.recovery = snapshot
             self.resume_active = {}
             self.recovery_by_href = {item['entry']['href']: item for item in snapshot.values() if item['entry']}
-            self.recovery_by_href.update(folders)
             self.recovery_destination = destination
             self.recovery_dav = dav
             self.recovery_error = ''
             self.downloaded = {item['entry']['href']: Entry(**item['entry']) for item in snapshot.values()
                                if item['status'] == 'complete'}
+            self.redraw_entry_states()
+            self.render_recovery()
+            folders = await asyncio.to_thread(inspect_folders, destination, visible, snapshot,
+                                              listings.list, cancelled.is_set)
+            if cancelled.is_set() or self.downloading or dav is not self.dav: return
+            self.recovery_by_href.update(folders)
             self.redraw_entry_states()
         except Exception as exc:
             if not cancelled.is_set(): self.recovery_error = self.err(exc)

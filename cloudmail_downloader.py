@@ -25,7 +25,7 @@ from download_state import (DownloadJournal, RESERVED_NAMES, inspect_destination
 
 BASE = "https://webdav.cloud.mail.ru/"
 RETRY_DELAYS = (5, 15, 30, 60)
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 def credentials_path():
     if os.name == 'nt':
         directory = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
@@ -1037,7 +1037,12 @@ class CloudApp(App):
                 folders = await asyncio.to_thread(inspect_folders, destination, visible, snapshot,
                                                   checked_list, cancelled.is_set)
                 if cancelled.is_set() or self.downloading or dav is not self.dav: return
-                self.recovery_by_href.update(folders)
+                folder_states = {key: item for key, item in folders.items()
+                                 if item.get('entry', {}).get('directory')}
+                nested_files = {key: item for key, item in folders.items()
+                                if not item.get('entry', {}).get('directory')}
+                self.recovery.update(nested_files)
+                self.recovery_by_href.update({item['entry']['href']: item for item in folder_states.values()})
                 self.redraw_entry_states()
             self.sync_status = ('Сверка завершена' if recursive else 'Каталог проверен') + f' · папок {len(checked)}' + time.strftime(' · %H:%M:%S')
         except Exception as exc:

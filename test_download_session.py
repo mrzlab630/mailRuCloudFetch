@@ -524,6 +524,50 @@ def test_folder_scan_recognizes_legacy_nested_files_without_adoption(tmp_path, r
     assert folders[folder.href]['status'] == 'attention'
 
 
+def test_folder_scan_adds_nested_missing_and_partial_files_to_recovery(tmp_path):
+    folder = m.Entry('/archive', 'archive', True)
+    nested = m.Entry('/archive/nested', 'nested', True)
+    missing = m.Entry('/archive/nested/missing.bin', 'missing.bin', False, 10, etag='"m1"')
+    partial = m.Entry('/archive/nested/partial.bin', 'partial.bin', False, 10, etag='"p1"')
+    (tmp_path / 'archive/nested').mkdir(parents=True)
+    (tmp_path / 'archive/nested/partial.bin').write_bytes(b'1234')
+    tree = {folder.href: [nested], nested.href: [missing, partial]}
+    result = m.inspect_folders(tmp_path, [folder], {}, tree.__getitem__)
+    assert result[folder.href]['status'] == 'partial'
+    assert result[nested.href]['status'] == 'partial'
+    assert result['archive/nested/missing.bin']['status'] == 'queued'
+    assert result['archive/nested/missing.bin']['can_resume']
+    assert result['archive/nested/missing.bin']['done'] == 0
+    assert result['archive/nested/partial.bin']['status'] == 'partial'
+    assert result['archive/nested/partial.bin']['can_resume']
+    assert result['archive/nested/partial.bin']['done'] == 4
+
+
+def test_sync_merges_nested_files_into_resume_screen(tmp_path):
+    folder = m.Entry('/archive', 'archive', True)
+    nested = m.Entry('/archive/nested', 'nested', True)
+    missing = m.Entry('/archive/nested/missing.bin', 'missing.bin', False, 10, etag='"m1"')
+    partial = m.Entry('/archive/nested/partial.bin', 'partial.bin', False, 10, etag='"p1"')
+    (tmp_path / 'archive/nested').mkdir(parents=True)
+    (tmp_path / 'archive/nested/partial.bin').write_bytes(b'1234')
+    tree = {'/': [folder], folder.href: [nested], nested.href: [missing, partial]}
+    class Fake:
+        auth = ('nested-recovery-account', 'key')
+        def list(self, path): return tree[path]
+    async def check():
+        app = m.CloudApp(Fake())
+        app.dest = tmp_path
+        async with app.run_test(size=(80, 24)) as pilot:
+            await wait_for_scan(app, pilot)
+            assert {'archive/nested/missing.bin', 'archive/nested/partial.bin'} <= set(app.recovery)
+            assert app.recovery['archive/nested/missing.bin']['status'] == 'queued'
+            assert app.recovery['archive/nested/partial.bin']['status'] == 'partial'
+            app.action_show_resume()
+            await pilot.pause(.1)
+            screen = app.screen
+            assert set(screen.order) == {'archive/nested/missing.bin', 'archive/nested/partial.bin'}
+            assert 'Незавершённых: 2 · можно продолжить: 2' in str(screen.widget('summary', m.Static).render())
+    asyncio.run(check())
 @pytest.mark.parametrize('problem', ['changed', 'short', 'symlink', 'missing-empty', 'new-file', 'new-folder', 'unavailable'])
 def test_folder_scan_never_confirms_incomplete_or_unchecked_trees(tmp_path, problem):
     folder = m.Entry('/archive', 'archive', True)

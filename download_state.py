@@ -286,9 +286,13 @@ def inspect_destination(destination, source, visible, list_remote, cancelled=lam
 
 
 def inspect_folders(destination, visible, files, list_remote, cancelled=lambda: False):
-    """Check mapped local directory trees without adding folders to the recovery queue."""
+    """Check mapped trees and return folder states plus incomplete nested files.
+
+    Folder keys are remote hrefs; file keys are local relative paths so the
+    caller can merge them into the durable recovery queue.
+    """
     result = {}
-    priority = {'complete': 0, 'found': 1, 'partial': 2, 'error': 3, 'attention': 4}
+    priority = {'complete': 0, 'found': 1, 'queued': 2, 'partial': 2, 'error': 3, 'attention': 4}
     for root in visible:
         if cancelled(): return {}
         if not root.directory: continue
@@ -311,7 +315,8 @@ def inspect_folders(destination, visible, files, list_remote, cancelled=lambda: 
             if cancelled(): return {}
             entry, relative, item, children = stack.pop()
             if children is not None:
-                item['status'] = max((child['status'] for child in children), key=priority.get, default='complete')
+                status = max((child['status'] for child in children), key=priority.get, default='complete')
+                item['status'] = 'partial' if status == 'queued' else status
                 item['message'] = ''
                 continue
             try:
@@ -340,8 +345,10 @@ def inspect_folders(destination, visible, files, list_remote, cancelled=lambda: 
                             status = 'attention'
                         elif record.get('status') in ('attention', 'error'):
                             status = record['status']
+                        elif local is None and record.get('status') in ('partial', 'queued', 'stopped'):
+                            status = record['status']
                         elif local is None:
-                            status = 'partial'
+                            status = 'queued'
                         elif child.bytes is None or local[0] != child.bytes:
                             status = 'partial' if child.bytes is not None and local[0] < child.bytes else 'attention'
                         elif record.get('status') == 'complete':
@@ -349,6 +356,18 @@ def inspect_folders(destination, visible, files, list_remote, cancelled=lambda: 
                         else:
                             status = 'found'
                         child_item['status'] = status
+                        if not child.directory and status not in ('complete', 'found'):
+                            child_item.update(
+                                target=child_relative.as_posix(),
+                                done=local[0] if local is not None else record.get('done', 0),
+                                total=child.bytes,
+                                can_resume=status in ('queued', 'partial', 'error', 'stopped'),
+                                can_accept=False,
+                                retryable=False,
+                                message=(record.get('message', '') if status in ('error', 'attention') else
+                                         'Ожидает скачивания' if status == 'queued' else
+                                         'Можно продолжить' if status == 'partial' else ''))
+                            result[child_relative.as_posix()] = child_item
                     except (OSError, ValueError):
                         child_item['status'] = 'attention'
                 stack.append((entry, relative, item, children))

@@ -122,7 +122,14 @@ def test_resume_shows_live_transfer_progress_and_controls(tmp_path, terminal_siz
         advance.set(); finish.set()
 
 
-def test_restart_restores_completed_partial_and_unstarted_queue(tmp_path):
+def test_restart_restores_completed_partial_and_unstarted_queue(tmp_path, monkeypatch):
+    # Keep this recovery fixture sequential so that its third file is unstarted.
+    policy = m.AutoConcurrency
+    def sequential(sizes):
+        controller = policy(sizes)
+        controller.limit = controller.maximum = 1
+        return controller
+    monkeypatch.setattr(m, 'AutoConcurrency', sequential)
     folder = m.Entry('/archive', 'archive', True)
     entries = [m.Entry('/archive/' + name, name, False, len(DATA), etag='"v1"')
                for name in ('waiting', 'partial', 'complete')]
@@ -156,7 +163,6 @@ def test_restart_restores_completed_partial_and_unstarted_queue(tmp_path):
             async with app.run_test(size=(80, 24)) as pilot:
                 await pilot.pause(.15)
                 app.query_one('#destination', m.Input).value = str(tmp_path)
-                app.query_one('#threads', m.Select).value = 1
                 app.selected = {folder.href: folder}
                 app.action_download()
                 await wait_for_batch(app, pilot)

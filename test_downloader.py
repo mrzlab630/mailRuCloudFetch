@@ -84,6 +84,8 @@ def test_ui_progressive_disclosure(tmp_path):
             assert table.region.height >= 16
             assert table.styles.scrollbar_size_vertical == 1
             assert app.query_one('#download',m.Button).region.height == 1
+            assert not app.query('#threads')
+            assert app.query_one('#destination').region.right >= 79
             await pilot.click('#toggle-credentials'); await pilot.pause(.3)
             assert app.query_one('#credentials',m.Vertical).has_class('open')
             assert table.region.height >= 10

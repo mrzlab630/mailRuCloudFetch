@@ -7,7 +7,7 @@ import ntpath
 import unicodedata
 from rich.text import Text
 from contextlib import contextmanager
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import quote, unquote, urlsplit
@@ -25,7 +25,7 @@ from download_state import (DownloadJournal, RESERVED_NAMES, inspect_destination
 
 BASE = "https://webdav.cloud.mail.ru/"
 RETRY_DELAYS = (5, 15, 30, 60)
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 def credentials_path():
     if os.name == 'nt':
         directory = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
@@ -183,6 +183,47 @@ class Entry:
 def selection_roots(picked):
     directories = {e.href for e in picked if e.directory}
     return [e for e in picked if not any(str(parent) in directories for parent in PurePosixPath(e.href).parents)]
+
+class AutoConcurrency:
+    """Bounded throughput probes; only the queue coordinator changes the limit."""
+    def __init__(self, sizes):
+        self.maximum = min(16, len(sizes))
+        average = sum(sizes) / len(sizes) if sizes and all(n is not None for n in sizes) else None
+        initial = 2 if average is None or average >= 64 * 1024**2 else 8 if average <= 1024**2 else 4
+        self.limit = min(initial, self.maximum)
+        self.errors = 0
+        self.sample = None
+        self.probe = None
+        self.cooldown_until = 0.
+
+    def observe(self, now, received, errors, saturated, paused=False):
+        if errors > self.errors:
+            self.limit = max(1, self.limit // 2) if self.maximum else 0
+            self.cooldown_until = now + 30
+            self.probe = None
+            self.sample = None
+        self.errors = errors
+        if paused or not saturated:
+            self.sample = None
+            self.probe = None
+            return
+        if self.sample is None:
+            self.sample = (now, received)
+            return
+        elapsed = now - self.sample[0]
+        if elapsed < 8: return
+        rate = max(0, received - self.sample[1]) / elapsed
+        self.sample = (now, received)
+        if now < self.cooldown_until: return
+        if self.probe is not None:
+            previous_limit, previous_rate = self.probe
+            self.probe = None
+            if rate < previous_rate * 1.10:
+                self.limit = previous_limit
+                self.maximum = previous_limit  # No repeated unhelpful probes in this batch.
+        elif rate > 0 and self.limit < self.maximum:
+            self.probe = (self.limit, rate)
+            self.limit = min(self.maximum, self.limit * 2)
 
 class DirectoryIndex:
     """Share complete directory listings and in-flight requests for one snapshot."""
@@ -686,8 +727,6 @@ class CloudApp(App):
     #credentials Label { width: 19; height: 1; }
     #credentials Button { margin-right: 1; }
     #destination { width: 1fr; }
-    #threads { width: 14; height: 1; border: none; margin-left: 1; }
-    #threads SelectCurrent { height: 1; border: none; padding: 0; }
     #user, #key, #master { width: 1fr; }
     DataTable { height: 1fr; min-height: 4; margin: 0 1; scrollbar-size: 1 1; }
     #details { height: 1; padding: 0 1; color: $text-muted; }
@@ -761,6 +800,10 @@ class CloudApp(App):
         self.resume_active = {}
         self.transfer_status = ''
         self.transfer_progress = 0
+        self.transfer_mode = ''
+        self.parallel_active = 0
+        self.parallel_limit = 0
+        self.temporary_failures = 0
         self.session_error = ''
         try:
             self.dest = saved_destination(SESSION_STATE, source_id(BASE, dav)) or self.dest
@@ -776,7 +819,6 @@ class CloudApp(App):
         with Horizontal(id='destination-row'):
             yield Label('Папка назначения',id='destination-label')
             yield Input(str(self.dest),placeholder='Введите путь',id='destination')
-            yield Select([(f'{n} потоков',n) for n in (1,2,4,8,16)],value=4,allow_blank=False,id='threads')
         with Horizontal(id='sync-row'):
             yield Static('Сверка не запускалась', id='sync-status', markup=False)
             yield Button('Сверить', id='sync')
@@ -1072,6 +1114,7 @@ class CloudApp(App):
         self.states = {entry.href: [item['done'], entry.bytes, 0, 'Ожидает', '']
                        for (entry, _), (_, item) in zip(self.jobs, chosen)}
         self.downloading = True
+        self.transfer_mode = 'careful'
         self.stop.clear(); self.paused = False; self.received = 0
         self.sample = self.rate_sample = (time.monotonic(), 0)
         self.query_one('#transfer').add_class('active')
@@ -1380,21 +1423,23 @@ class CloudApp(App):
         self.batch_picked = list(self.selected.values())
         self.jobs = []
         self.downloading=True; self.stop.clear(); self.paused=False; self.states={}; self.received=0; self.sample=(time.monotonic(),0)
+        self.transfer_mode = 'auto'
+        self.parallel_active = self.parallel_limit = self.temporary_failures = 0
         self.rate_sample = self.sample
         self.query_one('#transfer').add_class('active')
         self.query_one('#transfer-status',Static).update('Подсчитываю файлы и общий размер…')
         self.query_one('#bar',ProgressBar).update(progress=0)
-        self.download_batch(list(self.selected.values()),self.query_one('#threads',Select).value,self.listings)
+        self.download_batch(list(self.selected.values()),self.listings)
     @work(thread=True,group='downloads')
-    def download_batch(self,picked,threads,listings):
+    def download_batch(self,picked,listings):
         try:
-            with destination_lock(self.dest): self.run_download_batch(picked,threads,listings)
+            with destination_lock(self.dest): self.run_download_batch(picked,listings)
         except Exception as exc:
             self.call_from_thread(self.query_one('#transfer-status',Static).update,self.err(exc))
         finally:
             self.call_from_thread(self.finish_download)
 
-    def run_download_batch(self,picked,threads,listings):
+    def run_download_batch(self,picked,listings):
         try:
             self.call_from_thread(self.query_one('#transfer-status',Static).update,'Подсчитываю файлы и общий размер…')
             jobs=[]; directories=[]; seen=set(); targets=set()
@@ -1433,22 +1478,55 @@ class CloudApp(App):
             for d in directories: d.mkdir(parents=True,exist_ok=True)
             if not jobs:
                 self.call_from_thread(self.query_one('#transfer-status',Static).update,'Готово: пустые папки созданы, файлов нет')
-            with ThreadPoolExecutor(max_workers=threads) as pool:
-                futures=[]
-                for entry, target in jobs:
-                    record = confirmed.get(target.relative_to(self.dest).as_posix(), {})
-                    if record.get('status') == 'complete' and record['entry'] == asdict(entry):
-                        with self.lock: self.states[entry.href]=[entry.bytes or signature(target)[0],entry.bytes,0,'Готово','']
-                        self.call_from_thread(self.mark_downloaded,entry)
-                    else:
-                        futures.append(pool.submit(self.download_one,entry,target))
-                for f in futures: f.result()
+            pending, sizes = [], []
+            for entry, target in jobs:
+                record = confirmed.get(target.relative_to(self.dest).as_posix(), {})
+                if record.get('status') == 'complete' and record['entry'] == asdict(entry):
+                    with self.lock: self.states[entry.href]=[entry.bytes or signature(target)[0],entry.bytes,0,'Готово','']
+                    self.call_from_thread(self.mark_downloaded,entry)
+                else:
+                    pending.append((entry, target))
+                    sizes.append(max(0, entry.bytes - record.get('done', 0)) if entry.bytes is not None else None)
+            self.run_auto_queue(pending, sizes)
             successful_folders = [e for e in picked if e.directory and all(
                 self.states[file.href][3] == 'Готово'
                 for file, _ in jobs if file.href.startswith(e.href.rstrip('/')+'/'))]
             self.call_from_thread(self.clear_completed_folders, successful_folders)
         except Exception as exc:
             self.call_from_thread(self.query_one('#transfer-status',Static).update,self.err(exc))
+
+    def run_auto_queue(self, jobs, sizes):
+        if not jobs: return
+        controller = AutoConcurrency(sizes)
+        index, active = 0, set()
+        with ThreadPoolExecutor(max_workers=controller.maximum) as pool:
+            try:
+                while index < len(jobs) or active:
+                    finished = {future for future in active if future.done()}
+                    active.difference_update(finished)
+                    for future in finished: future.result()
+                    with self.lock:
+                        paused = self.paused
+                        # Completed files are immediately replaced from the queue;
+                        # these refills must not reset a full-load speed sample.
+                        saturated = (index > 0 and index < len(jobs) and
+                                     len(active) <= controller.limit <= len(active) + len(jobs) - index)
+                        controller.observe(time.monotonic(), self.received, self.temporary_failures,
+                                           saturated, paused)
+                        if self.stop.is_set():
+                            # Registered but unstarted jobs remain queued in the journal.
+                            for entry, _ in jobs[index:]:
+                                self.states[entry.href][2:] = [0, 'Остановлено', '']
+                            index = len(jobs)
+                        while not self.stop.is_set() and not paused and index < len(jobs) and len(active) < controller.limit:
+                            active.add(pool.submit(self.download_one, *jobs[index]))
+                            index += 1
+                        self.parallel_active = len(active)
+                        self.parallel_limit = controller.limit
+                    if active: wait(active, timeout=.25, return_when=FIRST_COMPLETED)
+                    elif index < len(jobs): self.stop.wait(.1)
+            finally:
+                with self.lock: self.parallel_active = 0
 
     def validate_job_targets(self, jobs, directories, destination):
         reserved=set()
@@ -1500,6 +1578,7 @@ class CloudApp(App):
                 except OSError: saved = 0
                 temporary = retryable_download_error(ex)
                 with self.lock:
+                    if temporary: self.temporary_failures += 1
                     self.states[e.href][0]=saved
                     self.states[e.href][2:]=[0,'Ошибка',self.err(ex)]
                     self.error_jobs[e.href]=(e,target)
@@ -1559,6 +1638,7 @@ class CloudApp(App):
                 self.states[entry.href][2:]=[0,'Ожидает','']
                 self.retry_attempts[entry.href]=0
             self.downloading=True
+            self.transfer_mode = 'careful'
         self.recovery_cancel.set()
         if self.recovery_timer is not None: self.recovery_timer.stop()
         self.recovery_scanning = False
@@ -1630,7 +1710,8 @@ class CloudApp(App):
             eta = f' · Осталось ≈ {duration(max(0,total-done)/self.measured_speed)}' if self.downloading and not self.paused and not unknown and not errors and speed > 0 and self.measured_speed > 0 and done < total else ''
             self.transfer_progress = pct
             phase = 'Пауза' if self.paused else 'Загрузка' if self.downloading else 'Остановлено' if self.stop.is_set() else 'Завершено с ошибками' if errors else 'Завершено'
-            self.transfer_status = (f'{phase}: {pct:.1f}% · {size(speed)}/s · {size(done)} / {size(total)}'+(f' (+{unknown} неизвестных размеров)' if unknown else '')+f'\nГотово: {complete}/{len(self.states)} · Ошибок: {len(errors)}'+eta+('\n'+errors[0] if errors else ''))
+            parallel = f' · Авто: {self.parallel_active}/{self.parallel_limit}' if self.downloading and self.transfer_mode == 'auto' and self.parallel_limit else ''
+            self.transfer_status = (f'{phase}: {pct:.1f}% · {size(speed)}/s · {size(done)} / {size(total)}'+(f' (+{unknown} неизвестных размеров)' if unknown else '')+f'\nГотово: {complete}/{len(self.states)} · Ошибок: {len(errors)}'+parallel+eta+('\n'+errors[0] if errors else ''))
             self.query_one('#transfer-status',Static).update(self.transfer_status)
             if isinstance(self.screen, DownloadTasksScreen): self.screen.render_transfer()
     async def action_quit(self):
